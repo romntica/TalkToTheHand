@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">TalkToTheHand</string>
+    <string name="status_initializing">Initializing...</string>
+    <string name="status_ready">Ready to receive recordings</string>
+    <string name="instruction_text">Recordings from your watch will be saved to your Downloads folder.</string>
+</resources>
