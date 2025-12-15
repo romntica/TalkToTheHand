@@ -1,6 +1,7 @@
 package com.jinn.talktothehand.presentation
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.widget.Toast
@@ -41,6 +42,7 @@ import com.jinn.talktothehand.presentation.theme.TalkToTheHandTheme
 
 class MainActivity : ComponentActivity() {
 
+    @SuppressLint("InvalidFragmentVersionForActivityResult")
     private val requestPermissionLauncher =
         registerForActivityResult(
             ActivityResultContracts.RequestPermission()
