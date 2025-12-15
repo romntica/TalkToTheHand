@@ -59,17 +59,37 @@ class FileTransferManager(private val context: Context) {
 
     /**
      * Scans the files directory for any finalized recordings (not temp)
-     * that haven't been deleted (ACK'd) yet, and enqueues them for transfer.
+     * AND also retries unexpected *temp files which might be from crashes.
      */
     fun checkAndRetryPendingTransfers() {
         val filesDir = context.filesDir
+        // Now including _temp files in the scan to recover crashed sessions
         val files = filesDir.listFiles { _, name -> 
-            name.endsWith(".m4a") && !name.contains("_temp") 
+            name.endsWith(".m4a") 
         }
         
         files?.forEach { file ->
-            Log.d("FileTransferManager", "Found pending file, retrying transfer: ${file.name}")
-            transferFile(file)
+            // If it's a temp file, we should probably rename it to a recovered file first
+            // so we don't try to transfer it while it's actively being written to (though this runs on init)
+            // But if the app just started, any existing _temp file is likely a leftover from a crash.
+            if (file.name.contains("_temp")) {
+                val lastModified = file.lastModified()
+                // If the file hasn't been modified in the last 1 minute, assume it's abandoned
+                if (System.currentTimeMillis() - lastModified > 60000) {
+                     Log.d("FileTransferManager", "Found abandoned temp file, recovering: ${file.name}")
+                     val recoveredName = file.name.replace("_temp", "_recovered")
+                     val recoveredFile = File(file.parent, recoveredName)
+                     if (file.renameTo(recoveredFile)) {
+                         transferFile(recoveredFile)
+                     } else {
+                         // If rename fails, try transferring as is
+                         transferFile(file)
+                     }
+                }
+            } else {
+                Log.d("FileTransferManager", "Found pending file, retrying transfer: ${file.name}")
+                transferFile(file)
+            }
         }
     }
     
