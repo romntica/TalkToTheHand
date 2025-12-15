@@ -52,6 +52,21 @@ class VoiceRecorder(private val context: Context) {
     
     private var isPausedByFocus = false
 
+    var currentFile: File? = null
+        private set
+
+    private var _startTime = 0L
+    private var _accumulatedTime = 0L
+
+    val durationMillis: Long
+        get() {
+            // If not recording, we return 0 (or previous duration if we wanted to support stopped state, but stop clears it)
+            if (!_isRecording.get()) return 0L
+            
+            val currentSession = if (!isPaused) System.currentTimeMillis() - _startTime else 0L
+            return _accumulatedTime + currentSession
+        }
+
     private val wakeLock = (context.getSystemService(Context.POWER_SERVICE) as? PowerManager)?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TalkToTheHand:RecordingWakeLock")
     
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
@@ -71,6 +86,8 @@ class VoiceRecorder(private val context: Context) {
     // bitRate is now fetched from config in initializeRecorder
     private val silenceThreshold = 1500
     private val silenceHoldMs = 1000L
+    
+    private var lastDebugLogTime = 0L
 
     fun start(outputFile: File): Boolean {
         // Prevent starting if we are recording OR if the previous job is still cleaning up
@@ -97,6 +114,11 @@ class VoiceRecorder(private val context: Context) {
         _isRecording.set(true)
         isPaused = false
         lastError = null // Reset error
+        
+        // Initialize timing and file
+        currentFile = outputFile
+        _startTime = System.currentTimeMillis()
+        _accumulatedTime = 0L
 
         recordingJob = recorderScope.launch {
             try {
@@ -285,6 +307,11 @@ class VoiceRecorder(private val context: Context) {
                 val now = System.currentTimeMillis()
                 if (maxAmp > silenceThreshold) {
                     lastSoundTime = now
+                }
+                
+                if (now - lastDebugLogTime > 3000) {
+                    Log.d("VoiceRecorder", "Current Amp: $maxAmp, Threshold: $silenceThreshold, Recording: ${now - lastSoundTime < silenceHoldMs}")
+                    lastDebugLogTime = now
                 }
 
                 // If silence is detected, we simply skip ENCODING this chunk.
@@ -482,6 +509,7 @@ class VoiceRecorder(private val context: Context) {
     fun pause() {
         if (isRecording && !isPaused) {
             isPaused = true
+            _accumulatedTime += System.currentTimeMillis() - _startTime
             try {
                 audioRecord?.stop()
             } catch (e: Exception) {
@@ -495,6 +523,7 @@ class VoiceRecorder(private val context: Context) {
             try {
                 audioRecord?.startRecording()
                 isPaused = false
+                _startTime = System.currentTimeMillis()
             } catch (e: Exception) {
                 e.printStackTrace()
                 // Recovery: Try to re-init or just stop?
@@ -540,6 +569,10 @@ class VoiceRecorder(private val context: Context) {
         try { abandonAudioFocus() } catch (_: Exception) { /* Ignored */ }
         
         safeReleaseWakeLock()
+        
+        currentFile = null
+        _accumulatedTime = 0L
+        _startTime = 0L
         
         Log.d("VoiceRecorder", "Cleanup complete")
     }

@@ -71,6 +71,23 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                 if (recorder.isRecording) {
                     isRecording = true
                     isPaused = recorder.isPaused
+                    
+                    // Restore current file if we lost it (e.g. Activity recreation)
+                    if (recordingFile == null) {
+                        recordingFile = recorder.currentFile
+                        // Restore timestamp from filename if possible, or just leave it
+                        // currentFileTimestamp is mostly used for naming the final file.
+                        // If we don't restore it, finalizeCurrentFile might use a new timestamp
+                        // or we can try to extract it.
+                        // For now, let's try to extract it from the file name if it matches pattern
+                        recordingFile?.name?.let { name ->
+                            val parts = name.split("_")
+                            if (parts.size >= 2) {
+                                currentFileTimestamp = parts[0] + "_" + parts[1]
+                            }
+                        }
+                    }
+
                     // We don't have exact start time if we rebound, but we can approximate or just start timer
                     if (timerJob == null) {
                         startTimer()
@@ -249,8 +266,13 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     break
                 }
 
-                val now = System.currentTimeMillis()
-                val currentElapsed = accumulatedTime + (now - startTime)
+                // Prefer accurate time from recorder service
+                val recorderDuration = recorder?.durationMillis ?: 0L
+                val currentElapsed = if (recorderDuration > 0) {
+                     recorderDuration
+                } else {
+                     accumulatedTime + (System.currentTimeMillis() - startTime)
+                }
                 
                 // Update State on Main Thread
                 withContext(Dispatchers.Main) {
