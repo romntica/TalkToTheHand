@@ -5,13 +5,11 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.Context
 import android.content.Intent
 import android.os.Binder
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.jinn.talktothehand.R
-import java.io.File
 
 class VoiceRecorderService : Service() {
 
@@ -23,9 +21,6 @@ class VoiceRecorderService : Service() {
     private val CHANNEL_ID = "VoiceRecorderChannel"
     private val NOTIFICATION_ID = 101
     
-    var sessionStartTime: Long = 0L
-        private set
-
     inner class LocalBinder : Binder() {
         fun getService(): VoiceRecorderService = this@VoiceRecorderService
     }
@@ -54,14 +49,6 @@ class VoiceRecorderService : Service() {
         super.onDestroy()
         recorder?.release()
         recorder = null
-    }
-    
-    fun startSession() {
-        sessionStartTime = System.currentTimeMillis()
-    }
-    
-    fun stopSession() {
-        sessionStartTime = 0L
     }
 
     private fun startForegroundService() {

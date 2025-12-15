@@ -80,7 +80,8 @@ class VoiceRecordingListenerService : WearableListenerService() {
                         rawFileName
                     } else {
                         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-                        "Recording_${timestamp}.m4a"
+                        // Changed extension to .aac for ADTS stream
+                        "Recording_${timestamp}.aac"
                     }
                     
                     // Use MediaStore for Android 10+ (Scoped Storage) compatibility.
@@ -88,7 +89,7 @@ class VoiceRecordingListenerService : WearableListenerService() {
                     val resolver = contentResolver
                     val contentValues = ContentValues().apply {
                         put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                        put(MediaStore.MediaColumns.MIME_TYPE, "audio/mp4")
+                        put(MediaStore.MediaColumns.MIME_TYPE, "audio/aac") // Updated MIME type for AAC
                         put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/TalkToTheHand")
                         put(MediaStore.MediaColumns.IS_PENDING, 1)
                     }

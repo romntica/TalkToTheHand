@@ -27,13 +27,15 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
+import java.lang.ref.WeakReference
 import java.util.Date
 import java.util.concurrent.TimeUnit
 
 class RecorderViewModel(application: Application) : AndroidViewModel(application) {
 
     // Removed direct VoiceRecorder instance. Now accessing via Service.
-    private var voiceRecorderService: VoiceRecorderService? = null
+    // Use WeakReference to avoid "StaticFieldLeaks" or "Context leaks" lint warnings
+    private var voiceRecorderServiceRef: WeakReference<VoiceRecorderService>? = null
     private var isBound = false
     
     private var recordingFile: File? = null
@@ -63,11 +65,12 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(className: ComponentName, service: IBinder) {
             val binder = service as VoiceRecorderService.LocalBinder
-            voiceRecorderService = binder.getService()
+            val serviceInstance = binder.getService()
+            voiceRecorderServiceRef = WeakReference(serviceInstance)
             isBound = true
             
             // Sync state if service was already running
-            voiceRecorderService?.recorder?.let { recorder ->
+            serviceInstance.recorder?.let { recorder ->
                 if (recorder.isRecording) {
                     isRecording = true
                     isPaused = recorder.isPaused
@@ -75,11 +78,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     // Restore current file if we lost it (e.g. Activity recreation)
                     if (recordingFile == null) {
                         recordingFile = recorder.currentFile
-                        // Restore timestamp from filename if possible, or just leave it
-                        // currentFileTimestamp is mostly used for naming the final file.
-                        // If we don't restore it, finalizeCurrentFile might use a new timestamp
-                        // or we can try to extract it.
-                        // For now, let's try to extract it from the file name if it matches pattern
+                        // Restore timestamp from filename if possible
                         recordingFile?.name?.let { name ->
                             val parts = name.split("_")
                             if (parts.size >= 2) {
@@ -98,7 +97,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
         override fun onServiceDisconnected(arg0: ComponentName) {
             isBound = false
-            voiceRecorderService = null
+            voiceRecorderServiceRef = null
         }
     }
 
@@ -132,11 +131,12 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     private fun startNewRecordingFile(): Boolean {
         // Use a filesystem-safe date format (avoid colons)
         currentFileTimestamp = DateFormat.format("yyyyMMdd_HHmmss", Date()).toString()
-        val fileName = "${currentFileTimestamp}_temp.m4a"
+        // Changed extension to .aac for ADTS stream
+        val fileName = "${currentFileTimestamp}_temp.aac"
         recordingFile = File(getApplication<Application>().filesDir, fileName)
         
         return recordingFile?.let {
-            val recorder = voiceRecorderService?.recorder
+            val recorder = voiceRecorderServiceRef?.get()?.recorder
             if (recorder != null) {
                 val started = recorder.start(it)
                 if (!started) {
@@ -159,7 +159,8 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                 // Only save if it's not a tiny file resulting from immediate error
                 // Also check if it's a valid recording session
                 if (seconds > 0 || file.length() > 4096) { 
-                    val newName = "${currentFileTimestamp}_${seconds}s.m4a"
+                    // Changed extension to .aac for ADTS stream
+                    val newName = "${currentFileTimestamp}_${seconds}s.aac"
                     val parentFile = file.parentFile ?: getApplication<Application>().filesDir
                     val newFile = File(parentFile, newName)
                     
@@ -194,13 +195,13 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun pauseRecording() {
-        voiceRecorderService?.recorder?.pause()
+        voiceRecorderServiceRef?.get()?.recorder?.pause()
         isPaused = true
         stopTimer()
     }
 
     fun resumeRecording() {
-        voiceRecorderService?.recorder?.resume()
+        voiceRecorderServiceRef?.get()?.recorder?.resume()
         isPaused = false
         startTimer()
     }
@@ -211,7 +212,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         
         viewModelScope.launch {
             try {
-                voiceRecorderService?.recorder?.stopRecording() // Suspend wait
+                voiceRecorderServiceRef?.get()?.recorder?.stopRecording() // Suspend wait
             } catch (e: Exception) {
                 Log.e("RecorderViewModel", "Error stopping recorder", e)
             }
@@ -246,7 +247,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         timerJob = viewModelScope.launch(Dispatchers.IO) { // Run on IO to handle file operations safely
             while (isActive) {
                 // Monitor if recorder stopped externally (e.g. max storage, error)
-                val recorder = voiceRecorderService?.recorder
+                val recorder = voiceRecorderServiceRef?.get()?.recorder
                 if (recorder != null && !recorder.isRecording && isRecording && !isPaused) {
                     withContext(Dispatchers.Main) {
                         // Check for error from recorder
@@ -256,8 +257,6 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                             vibrateError()
                         } else {
                             // Normal stop or limit reached without specific error message? 
-                            // If it's a limit, lastError should be set. 
-                            // If not, maybe just vibrate stop pattern.
                             val doubleBuzz = VibrationEffect.createWaveform(longArrayOf(0, 50, 50, 50), -1)
                             vibrate(doubleBuzz)
                         }
@@ -309,7 +308,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
              withContext(Dispatchers.Main) {
                  // Stop the current recorder safely
                  try {
-                     voiceRecorderService?.recorder?.stopRecording()
+                     voiceRecorderServiceRef?.get()?.recorder?.stopRecording()
                  } catch (e: Exception) {
                      Log.e("RecorderViewModel", "Error stopping for split", e)
                  }

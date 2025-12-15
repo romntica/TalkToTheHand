@@ -64,8 +64,9 @@ class FileTransferManager(private val context: Context) {
     fun checkAndRetryPendingTransfers() {
         val filesDir = context.filesDir
         // Now including _temp files in the scan to recover crashed sessions
+        // Changed extension to .aac for ADTS stream
         val files = filesDir.listFiles { _, name -> 
-            name.endsWith(".m4a") 
+            name.endsWith(".aac") 
         }
         
         files?.forEach { file ->
