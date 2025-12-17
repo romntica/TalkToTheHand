@@ -12,9 +12,17 @@ android {
         applicationId = "com.jinn.talktothehand"
         minSdk = 30
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0a"
+        versionCode = 2
+        versionName = "1.1.0"
 
+    }
+
+    // Added signingConfigs to allow building release variant with debug key
+    signingConfigs {
+        getByName("debug") { 
+            // This is the default location for the debug keystore and is portable
+            storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
+        }
     }
 
     buildTypes {
@@ -24,6 +32,8 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Point release builds to the debug signing config
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {

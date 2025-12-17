@@ -6,10 +6,10 @@ import androidx.core.content.edit
 class RecorderConfig(context: Context) {
     private val prefs = context.getSharedPreferences("recorder_config", Context.MODE_PRIVATE)
 
-    // Stored in KB to support 0.5 MB (512 KB)
-    var maxChunkSizeKb: Int
-        get() = prefs.getInt("max_chunk_kb", 1024) // Default 1 MB = 1024 KB
-        set(value) = prefs.edit { putInt("max_chunk_kb", value) }
+    // Stored in MB. Default 10MB.
+    var maxChunkSizeMb: Int
+        get() = prefs.getInt("max_chunk_mb", 10) 
+        set(value) = prefs.edit { putInt("max_chunk_mb", value) }
 
     // Stored in MB to support 100 MB increments
     var maxStorageSizeMb: Int
@@ -36,8 +36,20 @@ class RecorderConfig(context: Context) {
         get() = prefs.getBoolean("telemetry_enabled", false) // Default false as requested
         set(value) = prefs.edit { putBoolean("telemetry_enabled", value) }
         
+    // Silence detection threshold (amplitude)
+    var silenceThreshold: Int
+        get() = prefs.getInt("silence_threshold", 1000) // Default 1000
+        set(value) = prefs.edit { putInt("silence_threshold", value) }
+        
+    // Silence Detection Strategy
+    // 0 = Standard (Sleep CPU, Keep Mic On) - No data loss, good battery.
+    // 1 = Aggressive (Duty Cycling) - Mic Off during silence. Saves more battery, potential latency/clipping on wake.
+    var silenceDetectionStrategy: Int
+        get() = prefs.getInt("silence_strategy", 0) // Default 0 (Standard)
+        set(value) = prefs.edit { putInt("silence_strategy", value) }
+        
     val maxChunkSizeBytes: Long
-        get() = maxChunkSizeKb * 1024L
+        get() = maxChunkSizeMb * 1024L * 1024L
         
     val maxStorageSizeBytes: Long
         get() = maxStorageSizeMb * 1024L * 1024L

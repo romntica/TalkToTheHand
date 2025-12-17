@@ -34,19 +34,34 @@ class VoiceRecordingListenerService : WearableListenerService() {
         const val STATUS_COMPLETED = "COMPLETED"
         const val STATUS_FAILED = "FAILED"
         
-        private const val LOG_FILENAME = "wear_logs.txt"
+        // Action for broadcasting received config from watch
+        const val ACTION_CONFIG_RECEIVED = "com.jinn.talktothehand.CONFIG_RECEIVED"
+        const val EXTRA_CONFIG_DATA = "config_data"
     }
 
     override fun onMessageReceived(messageEvent: MessageEvent) {
         super.onMessageReceived(messageEvent)
         
-        if (messageEvent.path == "/telemetry/error") {
-            val logMessage = String(messageEvent.data, StandardCharsets.UTF_8)
-            Log.e("VoiceListener", "Received remote error: $logMessage")
+        when (messageEvent.path) {
+            "/telemetry/error" -> {
+                val logMessage = String(messageEvent.data, StandardCharsets.UTF_8)
+                Log.e("VoiceListener", "Received remote error: $logMessage")
+                
+                // Save to file
+                executor.execute {
+                    saveLogToFile(logMessage)
+                }
+            }
             
-            // Save to file
-            executor.execute {
-                saveLogToFile(logMessage)
+            "/config/current_v2" -> {
+                 Log.d("VoiceListener", "Received current config from watch")
+                 val configData = messageEvent.data
+                 // Broadcast this data to the app UI (e.g., Settings screen)
+                 val intent = Intent(ACTION_CONFIG_RECEIVED).apply {
+                     putExtra(EXTRA_CONFIG_DATA, configData)
+                     setPackage(packageName)
+                 }
+                 sendBroadcast(intent)
             }
         }
     }
@@ -85,7 +100,6 @@ class VoiceRecordingListenerService : WearableListenerService() {
                     }
                     
                     // Use MediaStore for Android 10+ (Scoped Storage) compatibility.
-                    // This is required for Galaxy S25 (Android 15+).
                     val resolver = contentResolver
                     val contentValues = ContentValues().apply {
                         put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
@@ -149,67 +163,51 @@ class VoiceRecordingListenerService : WearableListenerService() {
     }
     
     private fun saveLogToFile(message: String) {
-        val logLine = "$message\n\n"
+        // Create a unique filename for each error log to ensure it gets saved safely
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.getDefault()).format(Date())
+        val logFilename = "WearLog_$timestamp.txt"
         
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            saveLogToMediaStore(logLine)
+            saveLogToMediaStore(logFilename, message)
         } else {
-            saveLogToLegacyStorage(logLine)
+            saveLogToLegacyStorage(logFilename, message)
         }
     }
 
     @androidx.annotation.RequiresApi(Build.VERSION_CODES.Q)
-    private fun saveLogToMediaStore(logLine: String) {
+    private fun saveLogToMediaStore(filename: String, message: String) {
         val resolver = contentResolver
-        val relativePath = Environment.DIRECTORY_DOWNLOADS + "/TalkToTheHand/"
-        
-        val projection = arrayOf(MediaStore.MediaColumns._ID)
-        val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.RELATIVE_PATH} = ?"
-        val selectionArgs = arrayOf(LOG_FILENAME, relativePath)
-        
-        var uri: Uri? = null
+        val contentValues = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+            put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/TalkToTheHand/Logs")
+        }
         
         try {
-            // Try to find existing log file to append
-            resolver.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI, projection, selection, selectionArgs, null)?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID))
-                    uri = ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id)
+            val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
+            if (uri != null) {
+                resolver.openOutputStream(uri)?.use { outputStream ->
+                    outputStream.write(message.toByteArray(StandardCharsets.UTF_8))
                 }
-            }
-            
-            // Create new if not found
-            if (uri == null) {
-                val contentValues = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, LOG_FILENAME)
-                    put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/TalkToTheHand")
-                }
-                uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
-            }
-            
-            // Write data (append mode "wa")
-            uri?.let {
-                resolver.openOutputStream(it, "wa")?.use { outputStream ->
-                    outputStream.write(logLine.toByteArray(StandardCharsets.UTF_8))
-                }
-                Log.d("VoiceListener", "Telemetry appended to: $uri")
+                Log.d("VoiceListener", "Telemetry saved to: $uri")
+            } else {
+                Log.e("VoiceListener", "Failed to create MediaStore entry for log")
             }
         } catch (e: Exception) {
             Log.e("VoiceListener", "Failed to save telemetry to MediaStore", e)
         }
     }
 
-    private fun saveLogToLegacyStorage(logLine: String) {
+    private fun saveLogToLegacyStorage(filename: String, message: String) {
         try {
             val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-            val appDir = File(downloadsDir, "TalkToTheHand")
-            if (!appDir.exists()) {
-                appDir.mkdirs()
+            val logDir = File(downloadsDir, "TalkToTheHand/Logs")
+            if (!logDir.exists()) {
+                logDir.mkdirs()
             }
-            val logFile = File(appDir, LOG_FILENAME)
-            FileOutputStream(logFile, true).use { fos ->
-                fos.write(logLine.toByteArray(StandardCharsets.UTF_8))
+            val logFile = File(logDir, filename)
+            FileOutputStream(logFile).use { fos ->
+                fos.write(message.toByteArray(StandardCharsets.UTF_8))
             }
             Log.d("VoiceListener", "Telemetry saved to ${logFile.absolutePath}")
         } catch (e: Exception) {

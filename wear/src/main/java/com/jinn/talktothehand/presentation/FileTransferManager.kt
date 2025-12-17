@@ -13,7 +13,6 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.Worker
 import androidx.work.WorkerParameters
-import androidx.work.WorkRequest
 import com.google.android.gms.tasks.Tasks
 import com.google.android.gms.wearable.Wearable
 import kotlinx.coroutines.Dispatchers
@@ -65,10 +64,11 @@ class FileTransferManager(private val context: Context) {
         val filesDir = context.filesDir
         // Now including _temp files in the scan to recover crashed sessions
         // Changed extension to .aac for ADTS stream
-        val files = filesDir.listFiles { _, name -> 
+        val files = filesDir?.listFiles { _, name -> 
             name.endsWith(".aac") 
         }
         
+        // Safely iterate over files
         files?.forEach { file ->
             // If it's a temp file, we should probably rename it to a recovered file first
             // so we don't try to transfer it while it's actively being written to (though this runs on init)

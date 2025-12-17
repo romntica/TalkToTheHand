@@ -2,8 +2,14 @@ package com.jinn.talktothehand.presentation
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -25,12 +31,16 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.wear.compose.material.Button
 import androidx.wear.compose.material.Icon
@@ -47,11 +57,9 @@ class MainActivity : ComponentActivity() {
             ActivityResultContracts.RequestPermission()
         ) { isGranted: Boolean ->
             if (isGranted) {
-                // Permission is granted. Continue the action or workflow in your
-                // app.
+                // Permission is granted. Continue the action or workflow in your app.
             } else {
-                // Explain to the user that the feature is unavailable because the
-                // feature requires a permission that the user has denied.
+                // Explain to the user that the feature is unavailable
             }
         }
 
@@ -84,6 +92,54 @@ fun WearApp(
     checkPermission: () -> Boolean,
     requestPermission: () -> Unit
 ) {
+    // --- Lifecycle-aware UI Updates ---
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                if (viewModel.isRecording) {
+                    viewModel.startUiUpdates()
+                }
+            } else if (event == Lifecycle.Event.ON_PAUSE) {
+                viewModel.stopUiUpdates()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+    
+    // --- Config Change Notification ---
+    val context = LocalContext.current
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                val requiresRestart = intent.getBooleanExtra(ConfigListenerService.EXTRA_REQUIRES_RESTART, false)
+                if (requiresRestart) {
+                    if (viewModel.isRecording) {
+                        Toast.makeText(context, "Applying new audio settings...", Toast.LENGTH_SHORT).show()
+                        viewModel.restartRecordingSession()
+                    } else {
+                        Toast.makeText(context, "Audio settings updated", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter(ConfigListenerService.ACTION_CONFIG_CHANGED)
+        
+        // Android 14+ requires specifying RECEIVER_EXPORTED or RECEIVER_NOT_EXPORTED
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            context.registerReceiver(receiver, filter)
+        }
+        
+        onDispose {
+            context.unregisterReceiver(receiver)
+        }
+    }
+
     TalkToTheHandTheme {
         Box(
             modifier = Modifier
@@ -120,17 +176,9 @@ fun WearApp(
                 }
             }
             
-            // Error Handling
+            // Error Handling Overlay
             val errorMessage = viewModel.errorMessage
             if (errorMessage != null) {
-                // You can replace this with a Dialog or better UI
-                // For now, using a simple Text overlay or rely on Toast in the effect
-                LaunchedEffect(errorMessage) {
-                     // We can't show Toast from here directly without Context, 
-                     // but usually better to have a UI element.
-                }
-                
-                // Simple Error Overlay
                 Box(
                     modifier = Modifier
                         .fillMaxSize()

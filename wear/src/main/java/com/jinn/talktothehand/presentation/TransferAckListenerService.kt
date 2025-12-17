@@ -7,23 +7,37 @@ import java.io.File
 
 class TransferAckListenerService : WearableListenerService() {
 
+    companion object {
+        private const val TAG = "AckListener"
+        private const val ACK_PATH = "/voice_recording_ack"
+    }
+
     override fun onMessageReceived(messageEvent: MessageEvent) {
         super.onMessageReceived(messageEvent)
 
-        if (messageEvent.path == "/voice_recording_ack") {
-            val fileName = String(messageEvent.data)
-            Log.d("AckListener", "Received ACK for file: $fileName")
+        if (messageEvent.path == ACK_PATH) {
+            val rawFileName = String(messageEvent.data)
+            
+            // --- Security: Path Traversal Check ---
+            // Ensure the filename is not malicious and does not navigate directories.
+            val sanitizedFileName = File(rawFileName).name // Extracts only the filename part
+            if (sanitizedFileName != rawFileName) {
+                Log.e(TAG, "Path traversal attempt blocked. Original: $rawFileName, Sanitized: $sanitizedFileName")
+                return
+            }
 
-            // Locate the file in the app's files directory
-            val file = File(filesDir, fileName)
+            Log.d(TAG, "Received ACK for file: $sanitizedFileName")
+
+            // Locate the file in the app's private files directory
+            val file = File(filesDir, sanitizedFileName)
             if (file.exists()) {
                 if (file.delete()) {
-                    Log.d("AckListener", "File deleted successfully: $fileName")
+                    Log.d(TAG, "File deleted successfully: $sanitizedFileName")
                 } else {
-                    Log.w("AckListener", "Failed to delete file: $fileName")
+                    Log.w(TAG, "Failed to delete file: $sanitizedFileName")
                 }
             } else {
-                Log.w("AckListener", "File to delete not found: $fileName")
+                Log.w(TAG, "File to delete not found: $sanitizedFileName")
             }
         }
     }

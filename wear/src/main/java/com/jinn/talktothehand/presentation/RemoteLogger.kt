@@ -21,8 +21,20 @@ class RemoteLogger(private val context: Context) {
     private val config = RecorderConfig(context)
 
     fun error(tag: String, message: String, throwable: Throwable? = null) {
+        log(tag, "ERROR", message, throwable)
+    }
+    
+    fun info(tag: String, message: String) {
+        log(tag, "INFO", message, null)
+    }
+
+    private fun log(tag: String, level: String, message: String, throwable: Throwable?) {
         // 1. Log locally always
-        Log.e(tag, message, throwable)
+        if (level == "ERROR") {
+            Log.e(tag, message, throwable)
+        } else {
+            Log.i(tag, message)
+        }
 
         // 2. Check if telemetry is enabled
         if (!config.isTelemetryEnabled) {
@@ -32,7 +44,7 @@ class RemoteLogger(private val context: Context) {
         // 3. Prepare payload
         val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault()).format(Date())
         val sb = StringBuilder()
-        sb.append("[$timestamp] [ERROR] [$tag] $message")
+        sb.append("[$timestamp] [$level] [$tag] $message")
         if (throwable != null) {
             sb.append("\nStacktrace:\n")
             sb.append(Log.getStackTraceString(throwable))

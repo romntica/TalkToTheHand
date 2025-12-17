@@ -5,11 +5,13 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.os.Binder
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.jinn.talktothehand.R
+import java.io.File
 
 class VoiceRecorderService : Service() {
 
@@ -21,14 +23,23 @@ class VoiceRecorderService : Service() {
     private val CHANNEL_ID = "VoiceRecorderChannel"
     private val NOTIFICATION_ID = 101
     
+    private var remoteLogger: RemoteLogger? = null
+    
     inner class LocalBinder : Binder() {
         fun getService(): VoiceRecorderService = this@VoiceRecorderService
+        // Expose recorder directly for safer access
+        fun getRecorder(): VoiceRecorder? = recorder
     }
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        recorder = VoiceRecorder(this)
+        // Use applicationContext to avoid leaking the Service context if this instance is passed to ViewModel
+        val context = applicationContext
+        recorder = VoiceRecorder(context)
+        remoteLogger = RemoteLogger(context)
+        
+        remoteLogger?.info("VoiceRecorderService", "Service Created at ${System.currentTimeMillis()}")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -47,8 +58,10 @@ class VoiceRecorderService : Service() {
     
     override fun onDestroy() {
         super.onDestroy()
+        remoteLogger?.info("VoiceRecorderService", "Service Destroyed at ${System.currentTimeMillis()}")
         recorder?.release()
         recorder = null
+        remoteLogger = null
     }
 
     private fun startForegroundService() {

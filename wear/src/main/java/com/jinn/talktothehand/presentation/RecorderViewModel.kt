@@ -1,12 +1,9 @@
 package com.jinn.talktothehand.presentation
 
 import android.app.Application
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.content.ServiceConnection
 import android.os.Build
-import android.os.IBinder
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -22,27 +19,40 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
-import java.lang.ref.WeakReference
 import java.util.Date
 import java.util.concurrent.TimeUnit
 
+/**
+ * ViewModel for the Recorder screen.
+ * Handles UI state, service binding via RecorderServiceConnection, and high-level recording control.
+ *
+ * BATTERY OPTIMIZATION NOTE:
+ * This ViewModel implements "Lifecycle-Aware UI Updates".
+ * The timer that updates 'elapsedTimeMillis' and 'fileSizeString' runs ONLY
+ * when the app is visible (ON_RESUME). It stops when the app is backgrounded (ON_PAUSE).
+ * This prevents the CPU from waking up unnecessarily when the screen is off.
+ */
 class RecorderViewModel(application: Application) : AndroidViewModel(application) {
 
-    // Removed direct VoiceRecorder instance. Now accessing via Service.
-    // Use WeakReference to avoid "StaticFieldLeaks" or "Context leaks" lint warnings
-    private var voiceRecorderServiceRef: WeakReference<VoiceRecorderService>? = null
-    private var isBound = false
+    // Helper to manage service connection reactively
+    private val serviceConnection = RecorderServiceConnection(application)
+    
+    // Direct reference to recorder from the connection flow
+    // Safe to hold because it uses ApplicationContext
+    private var activeRecorder: VoiceRecorder? = null
     
     private var recordingFile: File? = null
     private var currentFileTimestamp = ""
     private val fileTransferManager = FileTransferManager(application)
-    private val config = RecorderConfig(application) // Config instance
+    private val config = RecorderConfig(application) 
     
+    // UI States
     var isRecording by mutableStateOf(false)
         private set
     
@@ -58,27 +68,25 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     var errorMessage by mutableStateOf<String?>(null)
         private set
 
-    private var timerJob: Job? = null
-    private var startTime = 0L
-    private var accumulatedTime = 0L
+    // Job for updating UI (elapsed time, file size).
+    private var uiUpdateJob: Job? = null
 
-    private val serviceConnection = object : ServiceConnection {
-        override fun onServiceConnected(className: ComponentName, service: IBinder) {
-            val binder = service as VoiceRecorderService.LocalBinder
-            val serviceInstance = binder.getService()
-            voiceRecorderServiceRef = WeakReference(serviceInstance)
-            isBound = true
-            
-            // Sync state if service was already running
-            serviceInstance.recorder?.let { recorder ->
-                if (recorder.isRecording) {
+    init {
+        // Start Service Connection
+        serviceConnection.bind()
+        
+        // Observe Recorder Availability
+        viewModelScope.launch {
+            serviceConnection.recorderFlow.collectLatest { recorder ->
+                activeRecorder = recorder
+                // Restore UI state if reconnecting to a running recorder
+                if (recorder != null && recorder.isRecording) {
                     isRecording = true
                     isPaused = recorder.isPaused
                     
-                    // Restore current file if we lost it (e.g. Activity recreation)
+                    // Restore file reference
                     if (recordingFile == null) {
                         recordingFile = recorder.currentFile
-                        // Restore timestamp from filename if possible
                         recordingFile?.name?.let { name ->
                             val parts = name.split("_")
                             if (parts.size >= 2) {
@@ -86,108 +94,110 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                             }
                         }
                     }
-
-                    // We don't have exact start time if we rebound, but we can approximate or just start timer
-                    if (timerJob == null) {
-                        startTimer()
-                    }
+                } else if (recorder == null) {
+                    // Service disconnected / unbound
+                    isRecording = false
                 }
             }
         }
-
-        override fun onServiceDisconnected(arg0: ComponentName) {
-            isBound = false
-            voiceRecorderServiceRef = null
-        }
-    }
-
-    init {
-        // Bind to the service
-        val intent = Intent(application, VoiceRecorderService::class.java)
-        application.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
         
-        // Check for any untransferred files from previous sessions
+        // Recover any abandoned files from previous crashes or ungraceful stops
         viewModelScope.launch(Dispatchers.IO) {
             fileTransferManager.checkAndRetryPendingTransfers()
         }
     }
 
+    /**
+     * Starts the recording process.
+     * 1. Starts Foreground Service (so recording survives backgrounding).
+     * 2. Initializes new file.
+     * 3. Starts hardware recording via Service.
+     *
+     * Runs on IO dispatcher to avoid blocking Main Thread during IPC calls.
+     */
     fun startRecording() {
-        errorMessage = null // Clear previous errors
+        errorMessage = null 
         
-        // Start Foreground Service
-        val intent = Intent(getApplication(), VoiceRecorderService::class.java)
-        intent.action = VoiceRecorderService.ACTION_START_FOREGROUND
-        getApplication<Application>().startForegroundService(intent)
-        
-        if (startNewRecordingFile()) {
-            isRecording = true
-            isPaused = false
-            vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE)) // Short buzz for start
-            startTimer()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // Explicitly start foreground service
+                val intent = Intent(getApplication(), VoiceRecorderService::class.java)
+                intent.action = VoiceRecorderService.ACTION_START_FOREGROUND
+                getApplication<Application>().startForegroundService(intent)
+                
+                if (startNewRecordingFile("User Button Press")) {
+                    withContext(Dispatchers.Main) {
+                        isRecording = true
+                        isPaused = false
+                        vibrate(VIBRATION_SHORT) 
+                        startUiUpdates() // Start UI timer since we are initiating from UI
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    errorMessage = "Failed to start: ${e.message}"
+                    vibrate(VIBRATION_ERROR)
+                }
+            }
         }
     }
     
-    private fun startNewRecordingFile(): Boolean {
-        // Use a filesystem-safe date format (avoid colons)
-        currentFileTimestamp = DateFormat.format("yyyyMMdd_HHmmss", Date()).toString()
-        // Changed extension to .aac for ADTS stream
-        val fileName = "${currentFileTimestamp}_temp.aac"
+    private fun startNewRecordingFile(reason: String): Boolean {
+        currentFileTimestamp = DateFormat.format(TIMESTAMP_FORMAT, Date()).toString()
+        val fileName = "${currentFileTimestamp}${SUFFIX_TEMP}"
         recordingFile = File(getApplication<Application>().filesDir, fileName)
         
-        return recordingFile?.let {
-            val recorder = voiceRecorderServiceRef?.get()?.recorder
+        return recordingFile?.let { file ->
+            val recorder = activeRecorder
             if (recorder != null) {
-                val started = recorder.start(it)
+                val started = recorder.start(file, reason)
                 if (!started) {
                     errorMessage = recorder.lastError ?: "Failed to start recording"
-                    vibrateError()
                 }
                 started
             } else {
                 errorMessage = "Service not connected"
-                vibrateError()
                 false
             }
         } ?: false
     }
 
+    /**
+     * Finalizes the current recording file.
+     * Renames from _temp.aac to final filename and queues for transfer.
+     */
     private fun finalizeCurrentFile() {
         recordingFile?.let { file ->
             if (file.exists()) {
                 val seconds = TimeUnit.MILLISECONDS.toSeconds(elapsedTimeMillis)
-                // Only save if it's not a tiny file resulting from immediate error
-                // Also check if it's a valid recording session
-                if (seconds > 0 || file.length() > 4096) { 
-                    // Changed extension to .aac for ADTS stream
-                    val newName = "${currentFileTimestamp}_${seconds}s.aac"
+                // Only save if significant content or time recorded (> 4KB or > 0s visible)
+                if (seconds > 0 || file.length() > MIN_FILE_SIZE_BYTES) { 
+                    val newName = "${currentFileTimestamp}_${seconds}s${SUFFIX_FINAL}"
                     val parentFile = file.parentFile ?: getApplication<Application>().filesDir
                     val newFile = File(parentFile, newName)
                     
                     var renameSuccess = file.renameTo(newFile)
                     if (!renameSuccess) {
-                        Log.w("RecorderViewModel", "Rename failed, trying manual copy/delete")
+                        Log.w(TAG, "Rename failed, trying manual copy/delete")
                         try {
                             file.copyTo(newFile, overwrite = true)
                             file.delete()
                             renameSuccess = true
                         } catch (e: IOException) {
-                            Log.e("RecorderViewModel", "Manual copy failed", e)
+                            Log.e(TAG, "Manual copy failed", e)
                             errorMessage = "Failed to save file: ${e.message}"
-                            vibrateError()
+                            vibrate(VIBRATION_ERROR)
                         }
                     }
                     
                     if (renameSuccess) {
                         fileTransferManager.transferFile(newFile)
                     } else {
-                        // If rename failed completely, try to transfer the original temp file
-                        // so at least we don't lose data, though the name will be ugly.
-                        Log.w("RecorderViewModel", "Transferring temp file as fallback")
+                        Log.w(TAG, "Transferring temp file as fallback")
                         fileTransferManager.transferFile(file)
                     }
                 } else {
-                    // Delete empty/broken file
+                    // Discard empty/tiny files
                     file.delete()
                 }
             }
@@ -195,46 +205,87 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun pauseRecording() {
-        voiceRecorderServiceRef?.get()?.recorder?.pause()
+        activeRecorder?.pause()
         isPaused = true
-        stopTimer()
     }
 
     fun resumeRecording() {
-        voiceRecorderServiceRef?.get()?.recorder?.resume()
+        activeRecorder?.resume()
         isPaused = false
-        startTimer()
     }
 
     fun stopRecording() {
-        // Stop timer immediately to prevent race conditions with split logic
-        stopTimer()
+        stopUiUpdates()
         
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             try {
-                voiceRecorderServiceRef?.get()?.recorder?.stopRecording() // Suspend wait
+                // Wait for recorder to finish its loop cleanly
+                activeRecorder?.stopRecording("User Button Press") 
             } catch (e: Exception) {
-                Log.e("RecorderViewModel", "Error stopping recorder", e)
+                Log.e(TAG, "Error stopping recorder", e)
             }
             
-            isRecording = false
-            isPaused = false
+            withContext(Dispatchers.Main) {
+                isRecording = false
+                isPaused = false
+            }
             
-            // Stop Foreground Service
+            // Stop Foreground Service to remove notification
             val intent = Intent(getApplication(), VoiceRecorderService::class.java)
             intent.action = VoiceRecorderService.ACTION_STOP_FOREGROUND
-            getApplication<Application>().startService(intent) // Triggers onStartCommand to stop foreground
+            getApplication<Application>().startService(intent) 
             
             finalizeCurrentFile()
             recordingFile = null
             
-            accumulatedTime = 0
-            elapsedTimeMillis = 0
-            fileSizeString = "0 MB"
+            withContext(Dispatchers.Main) {
+                elapsedTimeMillis = 0
+                fileSizeString = "0 MB"
+                vibrate(VIBRATION_DOUBLE)
+            }
+        }
+    }
+    
+    /**
+     * Restarts the current recording session to apply new settings.
+     * This respects the current paused state.
+     */
+    fun restartRecordingSession() {
+        if (!isRecording) return
+
+        val wasPaused = isPaused
+
+        viewModelScope.launch(Dispatchers.IO) {
+            Log.d(TAG, "Restarting recording session to apply new config...")
+            try {
+                activeRecorder?.stopRecording("Config Change Restart")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping for restart", e)
+            }
             
-            // Double buzz for stop
-            val doubleBuzz = VibrationEffect.createWaveform(longArrayOf(0, 50, 50, 50), -1) 
-            vibrate(doubleBuzz)
+            finalizeCurrentFile()
+            
+            if (startNewRecordingFile("Config Change Restart")) {
+                withContext(Dispatchers.Main) {
+                    isRecording = true
+                    
+                    if (wasPaused) {
+                        pauseRecording()
+                    } else {
+                        isPaused = false
+                        vibrate(VIBRATION_SHORT)
+                    }
+                }
+            } else {
+                withContext(Dispatchers.Main) {
+                    // Manually stop fully if restart fails
+                    activeRecorder?.stop("Restart Failed")
+                    isRecording = false
+                    isPaused = false
+                    errorMessage = "Failed to restart recording"
+                    vibrate(VIBRATION_ERROR)
+                }
+            }
         }
     }
     
@@ -242,92 +293,117 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         errorMessage = null
     }
 
-    private fun startTimer() {
-        startTime = System.currentTimeMillis()
-        timerJob = viewModelScope.launch(Dispatchers.IO) { // Run on IO to handle file operations safely
+    /**
+     * Starts the coroutine that updates the UI state (time, size).
+     * Should only be called when the UI is visible (ON_RESUME) to save battery.
+     */
+    fun startUiUpdates() {
+        if (uiUpdateJob?.isActive == true) return // Already running
+        
+        uiUpdateJob = viewModelScope.launch(Dispatchers.IO) { 
             while (isActive) {
-                // Monitor if recorder stopped externally (e.g. max storage, error)
-                val recorder = voiceRecorderServiceRef?.get()?.recorder
-                if (recorder != null && !recorder.isRecording && isRecording && !isPaused) {
+                // Monitor if recorder stopped externally (e.g. by service error)
+                val recorder = activeRecorder
+                if (recorder != null && !recorder.isRecording && isRecording) {
                     withContext(Dispatchers.Main) {
-                        // Check for error from recorder
                         val error = recorder.lastError
                         if (error != null) {
                             errorMessage = error
-                            vibrateError()
+                            vibrate(VIBRATION_ERROR)
                         } else {
-                            // Normal stop or limit reached without specific error message? 
-                            val doubleBuzz = VibrationEffect.createWaveform(longArrayOf(0, 50, 50, 50), -1)
-                            vibrate(doubleBuzz)
+                            vibrate(VIBRATION_DOUBLE)
                         }
-                        stopRecording()
+                        // Stop with specific reason for system-triggered stop
+                        stopRecordingInternal("System/Error Stop")
                     }
                     break
                 }
 
-                // Prefer accurate time from recorder service
+                // Get accurate duration from recorder
                 val recorderDuration = recorder?.durationMillis ?: 0L
-                val currentElapsed = if (recorderDuration > 0) {
-                     recorderDuration
-                } else {
-                     accumulatedTime + (System.currentTimeMillis() - startTime)
-                }
                 
-                // Update State on Main Thread
                 withContext(Dispatchers.Main) {
-                     elapsedTimeMillis = currentElapsed
+                     elapsedTimeMillis = recorderDuration
                      updateFileSize()
                 }
                 
                 checkFileSizeAndSplit()
-                delay(100)
-            }
-        }
-    }
-
-    private fun stopTimer() {
-        timerJob?.cancel()
-        accumulatedTime = elapsedTimeMillis
-    }
-
-    private fun updateFileSize() {
-        recordingFile?.let {
-            if (it.exists()) {
-                val size = it.length()
-                fileSizeString = Formatter.formatFileSize(getApplication(), size)
+                
+                // Update UI once per second to save battery
+                delay(TIMER_INTERVAL_MS)
             }
         }
     }
     
-    private suspend fun checkFileSizeAndSplit() {
-        val file = recordingFile
-        val maxChunkSizeBytes = config.maxChunkSizeBytes // Use dynamic config
+    /**
+     * Internal stop logic without UI-specific stop handling (like button double-press prevention).
+     * Used when the system or error stops the recording.
+     */
+    private suspend fun stopRecordingInternal(reason: String) {
+        stopUiUpdates()
         
-        if (file != null && file.exists() && file.length() >= maxChunkSizeBytes) {
-             // Split logic
-             withContext(Dispatchers.Main) {
-                 // Stop the current recorder safely
-                 try {
-                     voiceRecorderServiceRef?.get()?.recorder?.stopRecording()
-                 } catch (e: Exception) {
-                     Log.e("RecorderViewModel", "Error stopping for split", e)
-                 }
-                 
-                 finalizeCurrentFile()
-                 
-                 // Start new file
-                 if (!startNewRecordingFile()) {
-                     stopRecording()
-                 } else {
-                     // Reset timer base for new file? Or keep cumulative?
-                     // If we want cumulative time for the SESSION, we don't reset accumulatedTime.
-                     // But we DO reset the startTime because a new file has started writing.
-                     // Actually, if we want "Session Time", we keep accumulatedTime. 
-                     // BUT, if we are splitting, the "file size" corresponds to the NEW file, 
-                     // while "elapsed time" might correspond to total session. 
-                     // Let's assume we want Total Session Time.
-                 }
+        // Stop service and finalize
+        try {
+             // Recorder is likely already stopped if we are here, but ensure clean state
+             activeRecorder?.stop(reason)
+        } catch (e: Exception) { Log.e(TAG, "Error in internal stop", e) }
+        
+        isRecording = false
+        isPaused = false
+        
+        val intent = Intent(getApplication(), VoiceRecorderService::class.java)
+        intent.action = VoiceRecorderService.ACTION_STOP_FOREGROUND
+        getApplication<Application>().startService(intent)
+        
+        finalizeCurrentFile()
+        recordingFile = null
+        
+        elapsedTimeMillis = 0
+        fileSizeString = "0 MB"
+    }
+
+    /**
+     * Stops the UI update coroutine.
+     * Should be called when UI goes to background (ON_PAUSE).
+     */
+    fun stopUiUpdates() {
+        uiUpdateJob?.cancel()
+        uiUpdateJob = null
+    }
+
+    private fun updateFileSize() {
+        // Use the realtime size from the recorder directly
+        val size = activeRecorder?.currentFileSize ?: 0L
+        if (size > 0) {
+            fileSizeString = Formatter.formatFileSize(getApplication(), size)
+        }
+    }
+    
+    /**
+     * Checks if the current file has exceeded the max chunk size.
+     * If so, splits the recording by stopping and starting a new file.
+     * Runs on IO thread to avoid blocking main thread.
+     */
+    private suspend fun checkFileSizeAndSplit() {
+        val recorder = activeRecorder
+        val currentSize = recorder?.currentFileSize ?: 0L
+        val maxChunkSizeBytes = config.maxChunkSizeBytes 
+        
+        if (currentSize >= maxChunkSizeBytes) {
+             // Perform split logic
+             try {
+                 recorder?.stopRecording("File Split Limit Reached")
+             } catch (e: Exception) {
+                 Log.e(TAG, "Error stopping for split", e)
              }
+             
+             finalizeCurrentFile()
+             
+             if (!startNewRecordingFile("File Split Continue")) {
+                 withContext(Dispatchers.Main) {
+                     stopRecordingInternal("Split Restart Failed") 
+                 }
+             } 
         }
     }
     
@@ -335,16 +411,12 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             (getApplication<Application>().getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
         } else {
+            @Suppress("DEPRECATION")
             getApplication<Application>().getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         }
         if (vibrator.hasVibrator()) {
             vibrator.vibrate(effect)
         }
-    }
-    
-    private fun vibrateError() {
-        // Long buzz for error (500ms)
-        vibrate(VibrationEffect.createOneShot(500, VibrationEffect.DEFAULT_AMPLITUDE))
     }
     
     fun getFormattedTime(): String {
@@ -356,10 +428,21 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
     override fun onCleared() {
         super.onCleared()
-        // Unbind from service
-        if (isBound) {
-            getApplication<Application>().unbindService(serviceConnection)
-            isBound = false
-        }
+        // Delegate unbinding to our helper class
+        serviceConnection.unbind()
+    }
+    
+    companion object {
+        private const val TAG = "RecorderViewModel"
+        private const val TIMESTAMP_FORMAT = "yyyyMMdd_HHmmss"
+        private const val SUFFIX_TEMP = "_temp.aac"
+        private const val SUFFIX_FINAL = ".aac"
+        private const val MIN_FILE_SIZE_BYTES = 4096L
+        private const val TIMER_INTERVAL_MS = 1000L // 1Hz update for battery efficiency
+        
+        // Vibration Effects
+        private val VIBRATION_SHORT = VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE)
+        private val VIBRATION_DOUBLE = VibrationEffect.createWaveform(longArrayOf(0, 50, 50, 50), -1)
+        private val VIBRATION_ERROR = VibrationEffect.createOneShot(500, VibrationEffect.DEFAULT_AMPLITUDE)
     }
 }
