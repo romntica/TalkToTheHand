@@ -207,7 +207,7 @@ class VoiceRecorder(private val context: Context) {
                     val minBufferSize = AudioRecord.getMinBufferSize(rate, channelConfig, audioFormat)
                     if (minBufferSize != AudioRecord.ERROR && minBufferSize != AudioRecord.ERROR_BAD_VALUE) {
                         sampleRate = rate
-                        // Optimize for Battery: Use a larger buffer (32KB ~ 1s at 16kHz) to reduce CPU wakeups
+                        // Optimize for Battery: Use a larger buffer (64KB ~ 2s at 16kHz) to reduce CPU wakeups
                         bufferSize = maxOf(minBufferSize * 2, OPTIMAL_BUFFER_SIZE)
                         if (bufferSize > MAX_BUFFER_SIZE) bufferSize = MAX_BUFFER_SIZE
                         
@@ -700,7 +700,7 @@ class VoiceRecorder(private val context: Context) {
         private const val SAMPLE_RATE_48K = 48000
         private const val MIN_BUFFER_SIZE = 4096
         private const val OPTIMAL_BUFFER_SIZE = 65536 // Increased to 64KB for Max Battery Savings
-        private const val MAX_BUFFER_SIZE = 65536
+        private const val MAX_BUFFER_SIZE = 131072 // Increased max buffer too
         private const val WRITE_BUFFER_SIZE = 131072 // Increased to 128KB for write batching
         private const val SILENCE_HOLD_MS = 1000L
         private const val PAUSE_SLEEP_MS = 100L
