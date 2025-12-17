@@ -167,11 +167,13 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
      * Renames from _temp.aac to final filename and queues for transfer.
      */
     private fun finalizeCurrentFile() {
+        val finalFileSize = activeRecorder?.currentFileSize ?: 0L
+        
         recordingFile?.let { file ->
             if (file.exists()) {
                 val seconds = TimeUnit.MILLISECONDS.toSeconds(elapsedTimeMillis)
-                // Only save if significant content or time recorded (> 4KB or > 0s visible)
-                if (seconds > 0 || file.length() > MIN_FILE_SIZE_BYTES) { 
+                // **FIX**: Check against final size from recorder, not potentially stale file.length()
+                if (seconds > 0 || finalFileSize > MIN_FILE_SIZE_BYTES) { 
                     val newName = "${currentFileTimestamp}_${seconds}s${SUFFIX_FINAL}"
                     val parentFile = file.parentFile ?: getApplication<Application>().filesDir
                     val newFile = File(parentFile, newName)
@@ -268,7 +270,6 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             if (startNewRecordingFile("Config Change Restart")) {
                 withContext(Dispatchers.Main) {
                     isRecording = true
-                    
                     if (wasPaused) {
                         pauseRecording()
                     } else {
@@ -313,7 +314,6 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                         } else {
                             vibrate(VIBRATION_DOUBLE)
                         }
-                        // Stop with specific reason for system-triggered stop
                         stopRecordingInternal("System/Error Stop")
                     }
                     break

@@ -3,6 +3,7 @@ package com.jinn.talktothehand
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Intent
+import android.database.Cursor
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -163,42 +164,63 @@ class VoiceRecordingListenerService : WearableListenerService() {
     }
     
     private fun saveLogToFile(message: String) {
-        // Create a unique filename for each error log to ensure it gets saved safely
-        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.getDefault()).format(Date())
-        val logFilename = "WearLog_$timestamp.txt"
+        val logLine = "$message\n\n"
+        // Create a filename based on the current date for daily log rotation
+        val dateStamp = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+        val logFilename = "WearLog_$dateStamp.txt"
         
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            saveLogToMediaStore(logFilename, message)
+            saveLogToMediaStore(logFilename, logLine)
         } else {
-            saveLogToLegacyStorage(logFilename, message)
+            saveLogToLegacyStorage(logFilename, logLine)
         }
     }
 
     @androidx.annotation.RequiresApi(Build.VERSION_CODES.Q)
-    private fun saveLogToMediaStore(filename: String, message: String) {
+    private fun saveLogToMediaStore(filename: String, logLine: String) {
         val resolver = contentResolver
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
-            put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
-            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/TalkToTheHand/Logs")
-        }
+        val relativePath = Environment.DIRECTORY_DOWNLOADS + "/TalkToTheHand/Logs/"
         
+        // Use MediaStore to find an existing file or create a new one.
+        val queryUri = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+        val projection = arrayOf(MediaStore.Downloads._ID)
+        val selection = "${MediaStore.Downloads.DISPLAY_NAME} = ? AND ${MediaStore.Downloads.RELATIVE_PATH} = ?"
+        val selectionArgs = arrayOf(filename, relativePath)
+        
+        var existingUri: Uri? = null
         try {
-            val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
-            if (uri != null) {
-                resolver.openOutputStream(uri)?.use { outputStream ->
-                    outputStream.write(message.toByteArray(StandardCharsets.UTF_8))
+            resolver.query(queryUri, projection, selection, selectionArgs, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Downloads._ID))
+                    existingUri = ContentUris.withAppendedId(queryUri, id)
                 }
-                Log.d("VoiceListener", "Telemetry saved to: $uri")
+            }
+
+            val uri = existingUri ?: run {
+                // File does not exist, create it.
+                val contentValues = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+                }
+                resolver.insert(queryUri, contentValues)
+            }
+
+            if (uri != null) {
+                // Use "wa" mode (write-append) to append to the file.
+                resolver.openOutputStream(uri, "wa")?.use { outputStream ->
+                    outputStream.write(logLine.toByteArray(StandardCharsets.UTF_8))
+                }
+                Log.d("VoiceListener", "Telemetry appended to: $uri")
             } else {
-                Log.e("VoiceListener", "Failed to create MediaStore entry for log")
+                 Log.e("VoiceListener", "Failed to create or find log file URI")
             }
         } catch (e: Exception) {
             Log.e("VoiceListener", "Failed to save telemetry to MediaStore", e)
         }
     }
 
-    private fun saveLogToLegacyStorage(filename: String, message: String) {
+    private fun saveLogToLegacyStorage(filename: String, logLine: String) {
         try {
             val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
             val logDir = File(downloadsDir, "TalkToTheHand/Logs")
@@ -206,8 +228,9 @@ class VoiceRecordingListenerService : WearableListenerService() {
                 logDir.mkdirs()
             }
             val logFile = File(logDir, filename)
-            FileOutputStream(logFile).use { fos ->
-                fos.write(message.toByteArray(StandardCharsets.UTF_8))
+            // Use FileOutputStream with append = true
+            FileOutputStream(logFile, true).use { fos ->
+                fos.write(logLine.toByteArray(StandardCharsets.UTF_8))
             }
             Log.d("VoiceListener", "Telemetry saved to ${logFile.absolutePath}")
         } catch (e: Exception) {
