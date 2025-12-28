@@ -56,10 +56,9 @@ class MainActivity : ComponentActivity() {
         registerForActivityResult(
             ActivityResultContracts.RequestPermission()
         ) { isGranted: Boolean ->
-            if (isGranted) {
-                // Permission is granted. Continue the action or workflow in your app.
-            } else {
-                // Explain to the user that the feature is unavailable
+            if (!isGranted) {
+                // Explain to the user that the feature is unavailable because the
+                // features requires a permission that the user has denied.
             }
         }
 
@@ -92,7 +91,6 @@ fun WearApp(
     checkPermission: () -> Boolean,
     requestPermission: () -> Unit
 ) {
-    // --- Lifecycle-aware UI Updates ---
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -110,7 +108,6 @@ fun WearApp(
         }
     }
     
-    // --- Config Change Notification ---
     val context = LocalContext.current
     DisposableEffect(context) {
         val receiver = object : BroadcastReceiver() {
@@ -127,13 +124,7 @@ fun WearApp(
             }
         }
         val filter = IntentFilter(ConfigListenerService.ACTION_CONFIG_CHANGED)
-        
-        // Android 14+ requires specifying RECEIVER_EXPORTED or RECEIVER_NOT_EXPORTED
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            context.registerReceiver(receiver, filter)
-        }
+        ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
         
         onDispose {
             context.unregisterReceiver(receiver)
@@ -156,6 +147,7 @@ fun WearApp(
             ) {
                 if (!viewModel.isRecording) {
                     StartRecordingScreen(
+                        isBusy = viewModel.isBusy,
                         onStartClick = {
                             if (checkPermission()) {
                                 viewModel.startRecording()
@@ -166,6 +158,7 @@ fun WearApp(
                     )
                 } else {
                     RecordingScreen(
+                        isBusy = viewModel.isBusy,
                         formattedTime = viewModel.getFormattedTime(),
                         fileSize = viewModel.fileSizeString,
                         isPaused = viewModel.isPaused,
@@ -176,7 +169,6 @@ fun WearApp(
                 }
             }
             
-            // Error Handling Overlay
             val errorMessage = viewModel.errorMessage
             if (errorMessage != null) {
                 Box(
@@ -209,9 +201,10 @@ fun WearApp(
 }
 
 @Composable
-fun StartRecordingScreen(onStartClick: () -> Unit) {
+fun StartRecordingScreen(isBusy: Boolean, onStartClick: () -> Unit) {
     Button(
         onClick = onStartClick,
+        enabled = !isBusy, // Disable button when busy
         modifier = Modifier.size(64.dp)
     ) {
         Icon(
@@ -226,6 +219,7 @@ fun StartRecordingScreen(onStartClick: () -> Unit) {
 
 @Composable
 fun RecordingScreen(
+    isBusy: Boolean,
     formattedTime: String,
     fileSize: String,
     isPaused: Boolean,
@@ -251,18 +245,18 @@ fun RecordingScreen(
         horizontalArrangement = Arrangement.Center
     ) {
         if (isPaused) {
-            Button(onClick = onResumeClick) {
+            Button(onClick = onResumeClick, enabled = !isBusy) {
                 Icon(Icons.Default.PlayArrow, contentDescription = "Resume")
             }
         } else {
-            Button(onClick = onPauseClick) {
+            Button(onClick = onPauseClick, enabled = !isBusy) {
                 Icon(Icons.Default.Pause, contentDescription = "Pause")
             }
         }
         
         Spacer(modifier = Modifier.width(16.dp))
         
-        Button(onClick = onStopClick) {
+        Button(onClick = onStopClick, enabled = !isBusy) {
             Icon(Icons.Default.Stop, contentDescription = "Stop")
         }
     }

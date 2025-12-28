@@ -11,6 +11,7 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
+import androidx.work.Worker
 import androidx.work.WorkerParameters
 import com.google.android.gms.tasks.Tasks
 import com.google.android.gms.wearable.Wearable
@@ -22,7 +23,6 @@ import java.util.concurrent.TimeoutException
 
 class FileTransferManager(private val context: Context) {
     
-    // Create a single config instance to read settings
     private val config = RecorderConfig(context)
     
     init {
@@ -32,88 +32,76 @@ class FileTransferManager(private val context: Context) {
     fun transferFile(file: File) {
         if (!file.exists()) return
 
-        // Pass telemetry setting directly to the worker to avoid SharedPreferences issues in a background process
         val workData = Data.Builder()
-            .putString("file_path", file.absolutePath)
-            .putBoolean("telemetry_enabled", config.isTelemetryEnabled)
+            .putString(FileTransferWorker.KEY_FILE_PATH, file.absolutePath)
+            .putBoolean(FileTransferWorker.KEY_TELEMETRY_ENABLED, config.isTelemetryEnabled)
             .build()
             
-        // We use WorkManager to handle the transfer reliability.
         val transferWork = OneTimeWorkRequestBuilder<FileTransferWorker>()
             .setInputData(workData)
             .setConstraints(
                 Constraints.Builder()
-                    .setRequiredNetworkType(NetworkType.CONNECTED) // Requires connection (Bluetooth/WiFi) to phone
+                    .setRequiredNetworkType(NetworkType.CONNECTED)
                     .build()
             )
             .setBackoffCriteria(
-                androidx.work.BackoffPolicy.EXPONENTIAL, // Exponential backoff for better battery life
-                15000L, // Start with 15 seconds (15s, 30s, 60s, 2m, 4m...)
+                androidx.work.BackoffPolicy.EXPONENTIAL,
+                FileTransferWorker.BACKOFF_DELAY_MS,
                 TimeUnit.MILLISECONDS
             )
             .build()
 
         WorkManager.getInstance(context).enqueueUniqueWork(
-            "transfer_${file.name}", // Unique name per file
-            ExistingWorkPolicy.KEEP, // Don't duplicate if already queued
+            "${FileTransferWorker.UNIQUE_WORK_PREFIX}${file.name}",
+            ExistingWorkPolicy.KEEP, 
             transferWork
         )
     }
 
     /**
-     * Scans the files directory for any finalized recordings (not temp)
-     * AND also retries unexpected *temp files which might be from crashes.
+     * Scans the files directory for abandoned recordings and queues them for transfer.
      */
     fun checkAndRetryPendingTransfers() {
         val filesDir = context.filesDir
-        // Now including _temp files in the scan to recover crashed sessions
-        // Changed extension to .aac for ADTS stream
-        val files = filesDir?.listFiles { _, name -> 
-            name.endsWith(".aac") 
-        }
+        val files = filesDir?.listFiles { _, name -> name.endsWith(".aac") }
         
-        // Safely iterate over files
         files?.forEach { file ->
-            // If it's a temp file, we should probably rename it to a recovered file first
-            // so we don't try to transfer it while it's actively being written to (though this runs on init)
-            // But if the app just started, any existing _temp file is likely a leftover from a crash.
             if (file.name.contains("_temp")) {
-                val lastModified = file.lastModified()
-                // If the file hasn't been modified in the last 1 minute, assume it's abandoned
-                if (System.currentTimeMillis() - lastModified > 60000) {
-                     Log.d("FileTransferManager", "Found abandoned temp file, recovering: ${file.name}")
+                // If a temp file hasn't been modified in a minute, assume it's from a crash.
+                if (System.currentTimeMillis() - file.lastModified() > ABANDONED_FILE_THRESHOLD_MS) {
+                     Log.d(TAG, "Found abandoned temp file, recovering: ${file.name}")
                      val recoveredName = file.name.replace("_temp", "_recovered")
                      val recoveredFile = File(file.parent, recoveredName)
                      if (file.renameTo(recoveredFile)) {
                          transferFile(recoveredFile)
                      } else {
-                         // If rename fails, try transferring as is
-                         transferFile(file)
+                         transferFile(file) // Retry with original name if rename fails
                      }
                 }
             } else {
-                Log.d("FileTransferManager", "Found pending file, retrying transfer: ${file.name}")
+                Log.d(TAG, "Found finalized file, ensuring it's queued for transfer: ${file.name}")
                 transferFile(file)
             }
         }
     }
     
     private fun schedulePeriodicSync() {
-        // Run a background check every 15 minutes (minimum allowed by WorkManager)
-        // to cleanup any stuck files.
-        val syncWork = PeriodicWorkRequestBuilder<PendingFilesCheckWorker>(15, TimeUnit.MINUTES)
-            .setConstraints(
-                Constraints.Builder()
-                    .setRequiresBatteryNotLow(true)
-                    .build()
-            )
-            .build()
+        // Using 15 minutes directly to avoid a potential build issue with the MIN_PERIODIC_INTERVAL_MILLIS constant.
+        val syncWork = PeriodicWorkRequestBuilder<PendingFilesCheckWorker>(
+            15, 
+            TimeUnit.MINUTES
+        ).setConstraints(Constraints.Builder().setRequiresBatteryNotLow(true).build()).build()
 
         WorkManager.getInstance(context).enqueueUniquePeriodicWork(
-            "PeriodicFileSync",
+            PendingFilesCheckWorker.UNIQUE_WORK_NAME,
             ExistingPeriodicWorkPolicy.KEEP,
             syncWork
         )
+    }
+    
+    companion object {
+        private const val TAG = "FileTransferManager"
+        private const val ABANDONED_FILE_THRESHOLD_MS = 60000L
     }
 }
 
@@ -122,58 +110,52 @@ class FileTransferWorker(
     workerParams: WorkerParameters
 ) : CoroutineWorker(context, workerParams) {
 
-    // Logger is now nullable and initialized only if telemetry is enabled
     private var remoteLogger: RemoteLogger? = null
 
     override suspend fun doWork(): Result {
-        val filePath = inputData.getString("file_path") ?: return Result.failure()
+        val filePath = inputData.getString(KEY_FILE_PATH) ?: return Result.failure()
         val file = File(filePath)
         
-        // Read telemetry flag from worker data, not from SharedPreferences
-        val isTelemetryEnabled = inputData.getBoolean("telemetry_enabled", false)
-        if (isTelemetryEnabled) {
+        if (inputData.getBoolean(KEY_TELEMETRY_ENABLED, false)) {
             remoteLogger = RemoteLogger(applicationContext)
         }
         
-        remoteLogger?.info("FileTransferWorker", "Starting transfer for: ${file.name}")
+        remoteLogger?.info(TAG, "Starting transfer for: ${file.name}")
         
         if (!file.exists()) {
-             remoteLogger?.error("FileTransferWorker", "File not found for transfer: $filePath")
+             remoteLogger?.error(TAG, "File not found for transfer: $filePath")
              return Result.failure()
         }
 
         return try {
             val nodeClient = Wearable.getNodeClient(applicationContext)
             
-            // Wait for connected nodes with a timeout to avoid hanging indefinitely
             val nodes = withContext(Dispatchers.IO) {
                 try {
-                    Tasks.await(nodeClient.connectedNodes, 5000, TimeUnit.MILLISECONDS)
+                    Tasks.await(nodeClient.connectedNodes, NODE_CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
                 } catch (e: TimeoutException) {
-                    remoteLogger?.error("FileTransferWorker", "Timeout waiting for connected nodes")
+                    remoteLogger?.error(TAG, "Timeout waiting for connected nodes")
                     emptyList<com.google.android.gms.wearable.Node>()
                 }
             }
             
             val phoneNode = nodes.firstOrNull()
-            
             if (phoneNode == null) {
-                remoteLogger?.info("FileTransferWorker", "No connected node found. Retrying later.")
+                remoteLogger?.info(TAG, "No connected node found. Retrying later.")
                 return Result.retry() 
             }
 
             val channelClient = Wearable.getChannelClient(applicationContext)
             val channelPath = "/voice_recording/${file.name}"
             
-            remoteLogger?.info("FileTransferWorker", "Opening channel to ${phoneNode.displayName} for ${file.name}")
+            remoteLogger?.info(TAG, "Opening channel to ${phoneNode.displayName} for ${file.name}")
             
-            // Add timeouts to channel operations
             val channel = withContext(Dispatchers.IO) {
-                Tasks.await(channelClient.openChannel(phoneNode.id, channelPath), 10000, TimeUnit.MILLISECONDS)
+                Tasks.await(channelClient.openChannel(phoneNode.id, channelPath), CHANNEL_OPEN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             }
             
             val outputStream = withContext(Dispatchers.IO) {
-                Tasks.await(channelClient.getOutputStream(channel), 10000, TimeUnit.MILLISECONDS)
+                Tasks.await(channelClient.getOutputStream(channel), CHANNEL_OPEN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             }
 
             withContext(Dispatchers.IO) {
@@ -184,23 +166,36 @@ class FileTransferWorker(
                 }
             }
             
-            remoteLogger?.info("FileTransferWorker", "File stream sent successfully: ${file.name}")
+            remoteLogger?.info(TAG, "File stream sent successfully: ${file.name}")
             Result.success()
         } catch (e: Exception) {
-            remoteLogger?.error("FileTransferWorker", "Transfer failed, will retry.", e)
+            remoteLogger?.error(TAG, "Transfer failed, will retry.", e)
             Result.retry()
         }
+    }
+
+    companion object {
+        private const val TAG = "FileTransferWorker"
+        const val KEY_FILE_PATH = "file_path"
+        const val KEY_TELEMETRY_ENABLED = "telemetry_enabled"
+        const val UNIQUE_WORK_PREFIX = "transfer_"
+        const val BACKOFF_DELAY_MS = 15000L
+        private const val NODE_CONNECT_TIMEOUT_MS = 5000L
+        private const val CHANNEL_OPEN_TIMEOUT_MS = 10000L
     }
 }
 
 class PendingFilesCheckWorker(
     context: Context, 
     workerParams: WorkerParameters
-) : CoroutineWorker(context, workerParams) {
+) : Worker(context, workerParams) { // Changed to simple Worker
 
-    override suspend fun doWork(): Result {
-        // Re-use the manager logic to scan and enqueue
+    override fun doWork(): Result {
         FileTransferManager(applicationContext).checkAndRetryPendingTransfers()
         return Result.success()
+    }
+    
+    companion object {
+        const val UNIQUE_WORK_NAME = "PeriodicFileSync"
     }
 }

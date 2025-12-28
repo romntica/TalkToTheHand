@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 
+        Base application theme, appropriate for Wear OS. This theme is applied from the AndroidManifest.xml.
+        It ensures the app uses the device's native dark look and feel.
+    -->
+    <style name="Theme.TalkToTheHand" parent="android:Theme.DeviceDefault.NoActionBar" />
+</resources>
