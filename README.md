@@ -11,9 +11,9 @@ The app is architected for reliability, featuring background recording, resilien
 ### ⌚ Wear OS App
 *   **Resilient Recording:** Uses a **Foreground Service** to ensure recording continues if the app is backgrounded. Automatically recovers from hardware errors.
 *   **Advanced Power Saving:** Implements multiple strategies to maximize battery life:
-    *   **Write Batching:** Minimizes power-hungry storage writes.
-    *   **CPU Gating:** Reduces CPU wake-ups by processing audio in large chunks.
-    *   **Configurable VAD:** Features a software-based Voice Activity Detection with a "Standard" mode (sleeps CPU) and an "Aggressive" mode (powers down the microphone during long silences).
+    *   **Write Batching:** Minimizes power-hungry storage writes by using a small, efficient buffer with frequent fsyncs.
+    *   **CPU Gating:** Reduces CPU wake-ups by processing audio in efficient chunks.
+    *   **Configurable VAD:** Features a software-based Voice Activity Detection with a "Standard" mode (sleeps CPU) and an **"Aggressive" mode** (powers down the microphone)
 *   **Crash-Proof Files:** Saves audio in a raw **ADTS AAC** format, ensuring files are always playable, even if the app crashes mid-recording.
 *   **Smart Storage Management:** Automatically stops when a configurable storage limit is reached.
 *   **Resilient File Transfer:** Uses `WorkManager` with an exponential backoff policy to reliably transfer recordings to the paired phone, automatically handling connection drops.
@@ -77,10 +77,12 @@ If you are not a developer and just want to use the app, you can download the la
 
 5.  **Silence Power Saving:** The strategy used to save battery during silent periods.
     *   **Standard (Reliable):** Sleeps the CPU but keeps the microphone active. Good battery savings with zero risk of audio loss.
-    *   **Aggressive (Battery Saver):** Powers down the microphone during long silences. Offers the best battery life but may slightly clip the beginning of speech when waking up (latency of ~200-500ms).
+    *   **Aggressive (Battery Saver):** Powers down the microphone during long silences. It utilizes an **exponential backoff** strategy (ranging from 1s up to 30s) to minimize system IPC overhead and battery drain. Offers the best battery life but may have a slight wake-up latency.
+    *   **Note : power saving efficiency of each policy could be depending on the device.**
 
-6.  **Auto-Start on Boot:** Automatically launches the app when the watch starts up.
-7.  **Telemetry:** Sends event and error logs to the phone (`Downloads/TalkToTheHand/Logs`) for debugging.
+
+6.  **Auto-Start on Boot:** Automatically launches the app and begins recording (if configured) when the watch starts up.
+7.  **Telemetry:** Sends event and error logs with system metadata to the phone (`Downloads/TalkToTheHand/Logs`) for debugging.
 
 ## License
 

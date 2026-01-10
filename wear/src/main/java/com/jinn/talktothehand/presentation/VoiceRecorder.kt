@@ -29,32 +29,40 @@ import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.abs
+import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
- * Handles audio recording from the microphone, encoding to AAC (ADTS), and saving to file.
- * Features robustness against errors, battery optimization strategies, and background operation support.
+ * Advanced Voice Recorder with Precise PTS (Presentation Time Stamp) Management.
+ * 
+ * Features:
+ * - Chunked Encoding: Safely feeds data to MediaCodec.
+ * - Accurate PTS: Calculates timestamps based on samples to prevent "overlapping timestamp" errors.
+ * - Pre-roll (800ms) & Post-roll (1000ms): Prevents audio clipping.
  */
 class VoiceRecorder(private val context: Context) {
+
+    interface StateListener {
+        fun onRecordingStateChanged(isPaused: Boolean)
+        fun onError(message: String)
+    }
+
+    var stateListener: StateListener? = null
+
     @Volatile
     private var audioRecord: AudioRecord? = null
     @Volatile
     private var mediaCodec: MediaCodec? = null
     
-    // Use FileChannel for efficient writing without unnecessary allocations
     private var outputStream: FileOutputStream? = null
     private var fileChannel: FileChannel? = null
     
     private val config = RecorderConfig(context)
     private val remoteLogger = RemoteLogger(context)
     
-    // Use AtomicBoolean for thread-safe state flags
     private val _isRecording = AtomicBoolean(false)
-    val isRecording: Boolean
-        get() = _isRecording.get()
+    val isRecording: Boolean get() = _isRecording.get()
         
     @Volatile
     var lastError: String? = null
@@ -72,7 +80,6 @@ class VoiceRecorder(private val context: Context) {
     private var _startTime = 0L
     private var _accumulatedTime = 0L
     
-    // Track total bytes written to include pending buffer
     @Volatile
     private var _bytesWrittenToFile = 0L
 
@@ -83,16 +90,13 @@ class VoiceRecorder(private val context: Context) {
             return _accumulatedTime + currentSession
         }
         
-    // Expose total size (written + pending) for UI to prevent "0MB" display during buffering
     val currentFileSize: Long
         get() = _bytesWrittenToFile + writeBuffer.position()
 
     private val wakeLock = (context.getSystemService(Context.POWER_SERVICE) as? PowerManager)?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKELOCK_TAG)
-    
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     private var audioFocusRequest: AudioFocusRequest? = null
 
-    // Coroutine scope for background work
     private val recorderScope = CoroutineScope(Dispatchers.IO + Job())
     private var recordingJob: Job? = null
 
@@ -101,26 +105,24 @@ class VoiceRecorder(private val context: Context) {
     
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
-    private val silenceHoldMs = SILENCE_HOLD_MS
     
-    private var lastDebugLogTime = 0L
-    
-    // Reusable buffer for ADTS header to avoid allocation in loop
     private val adtsHeaderBuffer = ByteArray(7)
     private val adtsHeaderByteBuffer = ByteBuffer.wrap(adtsHeaderBuffer)
-    
-    // BATTERY OPTIMIZATION: Write Buffer
-    // Accumulate ~128KB of AAC data before writing to disk.
-    // 128KB AAC ~ 32 seconds of audio at 32kbps.
-    // This drastically reduces Flash storage wake-ups, saving power.
-    private val writeBuffer = ByteBuffer.allocateDirect(WRITE_BUFFER_SIZE)
+    private val writeBuffer = ByteBuffer.allocateDirect(16384)
 
-    // Updated start method to accept a reason
+    // --- VAD & Timing State ---
+    private var preRollBuffer: ShortArray? = null
+    private var isPreRollFlushed = false
+    private var currentDutyCycleDelayMs = BASE_DUTY_CYCLE_DELAY_MS
+    
+    /**
+     * Accurate tracking of samples processed in the current file session.
+     * Used to calculate monotonic Presentation Time Stamps (PTS).
+     */
+    private var totalSamplesProcessed = 0L
+
     fun start(outputFile: File, reason: String = "Unknown"): Boolean {
-        if (isRecording || (recordingJob?.isActive == true)) {
-            Log.w(TAG, "Cannot start: Recording in progress or cleanup incomplete")
-            return false
-        }
+        if (isRecording || (recordingJob?.isActive == true)) return false
 
         if (ActivityCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             remoteLogger.error(TAG, "Permission denied")
@@ -128,7 +130,6 @@ class VoiceRecorder(private val context: Context) {
         }
 
         safeReleaseWakeLock()
-        // Acquire wake lock to keep CPU running even if screen turns off
         wakeLock?.acquire(WAKELOCK_TIMEOUT_MS)
 
         if (!requestAudioFocus()) {
@@ -137,44 +138,46 @@ class VoiceRecorder(private val context: Context) {
             return false
         }
         
-        remoteLogger.info(TAG, "Recording STARTED ($reason) at ${System.currentTimeMillis()}")
+        remoteLogger.info(TAG, "Recording STARTED ($reason)")
 
         _isRecording.set(true)
         isPaused = false
+        isPausedByFocus = false
         lastError = null 
         
         currentFile = outputFile
         _startTime = System.currentTimeMillis()
         _accumulatedTime = 0L
-        _bytesWrittenToFile = 0L // Reset counter
-        writeBuffer.clear() // Reset write buffer
+        _bytesWrittenToFile = 0L
+        writeBuffer.clear()
+        
+        // --- Reset Timing State for New Session ---
+        totalSamplesProcessed = 0L
+        currentDutyCycleDelayMs = BASE_DUTY_CYCLE_DELAY_MS 
+        isPreRollFlushed = false
 
         recordingJob = recorderScope.launch {
             try {
-                // Open File Stream ONCE. We keep this open even if hardware restarts.
-                try {
-                    outputStream = FileOutputStream(outputFile)
-                    fileChannel = outputStream?.channel
-                } catch (e: Exception) {
-                    lastError = "Failed to create file: ${e.message}"
-                    return@launch
-                }
+                outputStream = FileOutputStream(outputFile)
+                fileChannel = outputStream?.channel
 
-                // Initial Hardware Setup
                 if (!initializeHardware()) {
                     lastError = "Initialization failed"
+                    stateListener?.onError(lastError ?: "Hardware init failed")
                     return@launch
                 }
                 
-                isPausedByFocus = false
+                val preRollSamples = (sampleRate * PRE_ROLL_MS / 1000).toInt()
+                preRollBuffer = ShortArray(preRollSamples)
                 
                 writeAudioData()
                 
             } catch (e: Exception) {
-                remoteLogger.error(TAG, "Recording error", e)
+                remoteLogger.error(TAG, "Recording session error", e)
                 lastError = "Recording error: ${e.message}"
+                stateListener?.onError(lastError ?: "Unknown error")
             } finally {
-                cleanup(reason = "Finished/Error") // Default cleanup reason if not explicitly stopped
+                cleanup(reason = "Finished/Error")
             }
         }
         
@@ -183,390 +186,257 @@ class VoiceRecorder(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     private fun initializeHardware(): Boolean {
-        // Clear previous instances if any to ensure clean state
         releaseMediaComponents()
-
         try {
             val configuredRate = config.samplingRate
             val supportedSampleRates = intArrayOf(SAMPLE_RATE_16K, SAMPLE_RATE_44K, SAMPLE_RATE_48K)
-            
-            // Prioritize configured rate
-            val ratesToTry = mutableListOf<Int>()
-            ratesToTry.add(configuredRate)
-            for (rate in supportedSampleRates) {
-                if (rate != configuredRate) {
-                    ratesToTry.add(rate)
-                }
+            val ratesToTry = mutableListOf<Int>().apply {
+                add(configuredRate)
+                supportedSampleRates.forEach { if (it != configuredRate) add(it) }
             }
             
-            var bufferSize = 0
             var validRateFound = false
-            
             for (rate in ratesToTry) {
                 try {
                     val minBufferSize = AudioRecord.getMinBufferSize(rate, channelConfig, audioFormat)
-                    if (minBufferSize != AudioRecord.ERROR && minBufferSize != AudioRecord.ERROR_BAD_VALUE) {
+                    if (minBufferSize > 0) {
                         sampleRate = rate
-                        // Optimize for Battery: Use a larger buffer (64KB ~ 2s at 16kHz) to reduce CPU wakeups
-                        bufferSize = maxOf(minBufferSize * 2, OPTIMAL_BUFFER_SIZE)
-                        if (bufferSize > MAX_BUFFER_SIZE) bufferSize = MAX_BUFFER_SIZE
-                        
-                        audioRecord = AudioRecord(
-                            MediaRecorder.AudioSource.MIC,
-                            sampleRate,
-                            channelConfig,
-                            audioFormat,
-                            bufferSize
-                        )
-                        
+                        recordingBufferSize = maxOf(minBufferSize * 2, OPTIMAL_BUFFER_SIZE)
+                        audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, channelConfig, audioFormat, recordingBufferSize)
                         if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
                             validRateFound = true
-                            recordingBufferSize = bufferSize
-                            Log.d(TAG, "Initialized with SampleRate: $sampleRate, BufferSize: $recordingBufferSize")
                             break
                         } else {
                             audioRecord?.release()
                             audioRecord = null
                         }
                     }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to init rate $rate", e)
-                }
+                } catch (_: Exception) {}
             }
 
-            if (!validRateFound || audioRecord == null) {
-                remoteLogger.error(TAG, "No supported sample rate found")
-                return false
-            }
+            if (!validRateFound || audioRecord == null) return false
 
-            val currentBitRate = config.bitrate
-            Log.d(TAG, "Using bitrate: $currentBitRate bps")
-            
             val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 1)
-            format.setInteger(MediaFormat.KEY_BIT_RATE, currentBitRate)
+            format.setInteger(MediaFormat.KEY_BIT_RATE, config.bitrate)
             format.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC) 
             format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, recordingBufferSize)
             
             mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
             mediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            
             mediaCodec?.start()
             audioRecord?.startRecording()
             
             return true
-
         } catch (e: Exception) {
-            remoteLogger.error(TAG, "Hardware Init failed", e)
             return false
         }
     }
 
     private suspend fun writeAudioData() = withContext(Dispatchers.IO) {
-        if (recordingBufferSize <= 0) {
-            lastError = "Invalid buffer size"
-            return@withContext
-        }
-
-        val buffer: ShortArray
-        try {
-            buffer = ShortArray(recordingBufferSize / 2) 
-        } catch (e: OutOfMemoryError) {
-            lastError = "Out of memory"
-            return@withContext
-        }
-
+        val buffer = ShortArray(recordingBufferSize / 2)
         val bufferInfo = MediaCodec.BufferInfo()
-        var currentFileSize = 0L
         val maxStorageBytes = config.maxStorageSizeBytes
-        var errorCount = 0
-
-        // Helper to drain output from MediaCodec, returns true if EOS reached
-        fun drainOutput(timeoutUs: Long): Boolean {
-            try {
-                var outputBufferIndex = mediaCodec?.dequeueOutputBuffer(bufferInfo, timeoutUs) ?: -1
-                while (outputBufferIndex >= 0 || outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                        // ADTS format handles config inline, no track setup needed
-                    } else {
-                        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                            bufferInfo.size = 0
-                        }
-                        
-                        if (bufferInfo.size != 0) {
-                            val encodedData = mediaCodec?.getOutputBuffer(outputBufferIndex)
-                            if (encodedData != null) {
-                                encodedData.position(bufferInfo.offset)
-                                encodedData.limit(bufferInfo.offset + bufferInfo.size)
-                                
-                                val packetSize = bufferInfo.size + 7
-                                
-                                // Write Batching Logic:
-                                // Check if write buffer has space, if not flush to disk
-                                if (writeBuffer.remaining() < packetSize) {
-                                    writeBuffer.flip()
-                                    val written = fileChannel?.write(writeBuffer) ?: 0
-                                    _bytesWrittenToFile += written
-                                    writeBuffer.clear()
-                                }
-
-                                // 1. Put ADTS Header
-                                fillADTSHeader(adtsHeaderBuffer, packetSize)
-                                adtsHeaderByteBuffer.clear()
-                                // Copy from array to ByteBuffer if needed, or just put array directly if supported
-                                // Since writeBuffer is direct, put(ByteArray) works fine.
-                                writeBuffer.put(adtsHeaderBuffer)
-                                
-                                // 2. Put Body
-                                writeBuffer.put(encodedData)
-                                
-                                currentFileSize += packetSize
-                                // Reset error count on successful write indicating healthy state
-                                errorCount = 0
-                            }
-                        }
-                        
-                        mediaCodec?.releaseOutputBuffer(outputBufferIndex, false)
-                        
-                        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                            return true
-                        }
-                    }
-                    outputBufferIndex = mediaCodec?.dequeueOutputBuffer(bufferInfo, 0) ?: -1
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Drain error", e)
-                throw e // Re-throw to trigger recovery in main loop
-            }
-            return false
-        }
-
-        var lastSoundTime = System.currentTimeMillis()
-        var silenceDurationMs = 0L // Track continuous silence
         
-        // Hysteresis State: 0 = Silence, 1 = Voice
-        var vadState = 0
-        
-        // Use shorter frame size for VAD analysis (e.g. 30ms at 16kHz is 480 samples)
+        var lastSoundTime = 0L 
+        var silenceDurationMs = 0L
         val vadFrameSize = (sampleRate * 0.03).toInt() 
 
         while (isActive && _isRecording.get()) {
             try {
-                // Check Max Storage
-                if (currentFileSize >= maxStorageBytes) {
-                    Log.w(TAG, "Max storage limit reached")
-                    lastError = "Storage limit reached"
-                    // Internal stop due to limits
-                    _isRecording.set(false) // Trigger loop exit
-                    // Cleanup will log 'Finished/Error' unless we passed a reason, but here we break loop
-                    break
-                }
-
-                if (isPaused) {
-                    delay(PAUSE_SLEEP_MS) 
-                    continue
-                }
+                if (currentFileSize >= maxStorageBytes) break
+                if (isPaused) { delay(100); continue }
                 
-                // Ensure hardware is initialized before reading
-                if (audioRecord == null) {
-                    throw RuntimeException("AudioRecord is null")
-                }
-
                 val readSize = audioRecord?.read(buffer, 0, buffer.size) ?: -1
-                
-                if (readSize < 0) {
-                     // Check for critical errors that need recovery
-                    if (readSize == AudioRecord.ERROR_DEAD_OBJECT || readSize == AudioRecord.ERROR_INVALID_OPERATION) {
-                        Log.e(TAG, "Critical AudioRecord error: $readSize. Attempting recovery.")
-                        throw RuntimeException("AudioRecord dead object")
-                    }
-                    
-                    if (isPaused) continue
-                    Log.w(TAG, "AudioRecord read error: $readSize")
-                    delay(PAUSE_SLEEP_MS) 
-                    continue
-                }
-                
-                if (readSize == 0) {
-                    delay(EMPTY_READ_SLEEP_MS) 
-                    continue
-                }
+                if (readSize <= 0) { delay(10); continue }
 
-                // --- Improved VAD: RMS & Hysteresis ---
-                val currentSilenceThreshold = config.silenceThreshold
-                val strategy = config.silenceDetectionStrategy
-                
-                // Calculate RMS for finer-grained analysis
-                // We analyze in chunks (frames) to avoid averaging out short bursts
-                var isVoiceDetectedInChunk = false
-                
+                var isVoiceDetected = false
                 var offset = 0
+                val threshold = config.silenceThreshold.toDouble()
+                
                 while (offset + vadFrameSize <= readSize) {
                     var sumSquares = 0.0
                     for (i in 0 until vadFrameSize) {
-                        val sample = buffer[offset + i].toDouble()
-                        sumSquares += sample * sample
+                        val s = buffer[offset + i].toDouble()
+                        sumSquares += s * s
                     }
-                    val rms = sqrt(sumSquares / vadFrameSize)
-                    
-                    // Simple Hysteresis logic
-                    // If currently silent, need higher threshold (User Config) to trigger Voice
-                    // If currently voice, stay in voice until drops below lower threshold (Config * 0.5)
-                    val threshold = if (vadState == 1) currentSilenceThreshold * 0.5 else currentSilenceThreshold.toDouble()
-                    
-                    if (rms > threshold) {
-                        vadState = 1
-                        isVoiceDetectedInChunk = true
-                    } else {
-                        // Only switch to silence if we were in voice
-                        // We rely on the silenceHoldMs timer for the actual "off" logic later
-                        if (vadState == 1 && rms < threshold) {
-                             vadState = 0
-                        }
+                    if (sqrt(sumSquares / vadFrameSize) > threshold) {
+                        isVoiceDetected = true
+                        break
                     }
                     offset += vadFrameSize
                 }
 
                 val now = System.currentTimeMillis()
-                val bufferDurationMs = (readSize.toLong() * 1000) / sampleRate
-                
-                if (isVoiceDetectedInChunk) {
+
+                if (isVoiceDetected) {
                     lastSoundTime = now
                     silenceDurationMs = 0
-                } else {
-                    silenceDurationMs += bufferDurationMs
-                }
-
-                if (now - lastSoundTime < silenceHoldMs) {
-                    // Audio present - Process it
-                    val inputBufferIndex = mediaCodec?.dequeueInputBuffer(DEQUEUE_TIMEOUT_US) ?: -1
-                    if (inputBufferIndex >= 0) {
-                        val inputBuffer = mediaCodec?.getInputBuffer(inputBufferIndex)
-                        if (inputBuffer != null) {
-                            inputBuffer.clear()
-                            val bytesRequired = readSize * 2
-                            if (inputBuffer.capacity() >= bytesRequired) {
-                                inputBuffer.asShortBuffer().put(buffer, 0, readSize)
-                                mediaCodec?.queueInputBuffer(inputBufferIndex, 0, bytesRequired, 0, 0)
-                            } else {
-                                // Handle overflow simply by dropping frame
-                                 mediaCodec?.queueInputBuffer(inputBufferIndex, 0, 0, 0, 0)
-                            }
-                        }
-                    }
-                } else {
-                    // Silence detected
+                    currentDutyCycleDelayMs = BASE_DUTY_CYCLE_DELAY_MS 
                     
-                    // STRATEGY 1: Aggressive Duty Cycling (Mic OFF)
-                    // If silence persists > 5 seconds and strategy is aggressive
-                    if (strategy == 1 && silenceDurationMs > 5000) {
-                        // Log.d(TAG, "Deep Sleep: Stopping Mic for 1s")
-                        try {
-                            // Turn OFF Mic
-                            audioRecord?.stop()
-                            // Sleep CPU for 1s
-                            delay(1000) 
-                            // Turn ON Mic
-                            if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
-                                audioRecord?.startRecording()
-                            }
-                            // Reset silence counter partially to avoid thrashing, 
-                            // but keep it high so we can go back to sleep quickly if silence persists.
-                            // However, we need to read new data to update silence status.
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Duty cycle error", e)
+                    if (!isPreRollFlushed) {
+                        preRollBuffer?.let { prBuffer ->
+                            processEncodingRobust(prBuffer, prBuffer.size)
                         }
+                        isPreRollFlushed = true
+                    }
+                    
+                    processEncodingRobust(buffer, readSize)
+                } else {
+                    silenceDurationMs += (readSize * 1000L) / sampleRate
+                    
+                    if (now - lastSoundTime < SILENCE_HOLD_MS) {
+                        processEncodingRobust(buffer, readSize)
                     } else {
-                        // STRATEGY 0: Standard (Mic ON, CPU Sleep)
-                        // Sleep exactly as long as the buffer duration
-                        delay(bufferDurationMs) 
+                        updatePreRollBuffer(buffer, readSize)
+                        isPreRollFlushed = false 
+                        
+                        if (config.silenceDetectionStrategy == 1 && silenceDurationMs > DEEP_SILENCE_THRESHOLD_MS) {
+                            performAggressiveDutyCycleBackoff()
+                        } else {
+                            delay((readSize * 1000L) / sampleRate)
+                        }
                     }
                 }
-
-                drainOutput(0)
+                
+                drainOutput(bufferInfo)
 
             } catch (e: Exception) {
-                Log.e(TAG, "Error in recording loop", e)
-                errorCount++
-                
-                // Indefinite recovery with exponential backoff capped at 10s
-                val backoffDelay = min(BASE_BACKOFF_DELAY_MS * (2.0.pow(errorCount - 1)).toLong(), MAX_BACKOFF_DELAY_MS)
-                Log.i(TAG, "Attempting hardware recovery... ($errorCount) in ${backoffDelay}ms")
-                
-                try {
-                    delay(backoffDelay) 
-                    if (!initializeHardware()) {
-                        Log.e(TAG, "Recovery failed")
-                    } else {
-                         Log.i(TAG, "Hardware recovered successfully")
-                         errorCount = 0 // Reset on success
-                    }
-                } catch (recEx: Exception) {
-                    Log.e(TAG, "Recovery crashed", recEx)
-                }
+                Log.e(TAG, "Critical loop error", e)
+                delay(1000)
             }
         }
         
-        // --- End of Stream Handling ---
+        drainOutput(bufferInfo, isEos = true)
+        flushBuffer(forceSync = true)
+    }
+
+    private fun updatePreRollBuffer(buffer: ShortArray, readSize: Int) {
+        val prBuffer = preRollBuffer ?: return
+        val prSize = prBuffer.size
+        if (readSize >= prSize) {
+            System.arraycopy(buffer, readSize - prSize, prBuffer, 0, prSize)
+        } else {
+            val remaining = prSize - readSize
+            System.arraycopy(prBuffer, readSize, prBuffer, 0, remaining)
+            System.arraycopy(buffer, 0, prBuffer, remaining, readSize)
+        }
+    }
+
+    private suspend fun performAggressiveDutyCycleBackoff() {
         try {
-            val inputBufferIndex = mediaCodec?.dequeueInputBuffer(EOS_TIMEOUT_US) ?: -1
-            if (inputBufferIndex >= 0) {
-                mediaCodec?.queueInputBuffer(inputBufferIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+            audioRecord?.stop()
+            delay(currentDutyCycleDelayMs)
+            currentDutyCycleDelayMs = min(currentDutyCycleDelayMs * 2, MAX_DUTY_CYCLE_DELAY_MS)
+            if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
+                audioRecord?.startRecording()
             }
-            // Drain final data
-            drainOutput(EOS_TIMEOUT_US)
-            
-            // Flush any remaining data in the write buffer to disk
+        } catch (e: Exception) {
+            Log.e(TAG, "Duty cycle error", e)
+        }
+    }
+
+    /**
+     * Robust encoding with Precise PTS.
+     * Splits large buffers into encoder-compatible chunks and assigns accurate timestamps.
+     */
+    private fun processEncodingRobust(buffer: ShortArray, readSize: Int) {
+        var offset = 0
+        while (offset < readSize) {
+            val inputIdx = mediaCodec?.dequeueInputBuffer(10000) ?: -1
+            if (inputIdx >= 0) {
+                val inputBuffer = mediaCodec?.getInputBuffer(inputIdx) ?: break
+                inputBuffer.clear()
+                
+                val maxShorts = inputBuffer.capacity() / 2
+                val shortsToPut = min(readSize - offset, maxShorts)
+                
+                inputBuffer.asShortBuffer().put(buffer, offset, shortsToPut)
+                
+                // CALCULATE PTS: Based on accumulated samples. 
+                // Formula: (TotalSamples * 1,000,000) / SampleRate
+                val ptsUs = (totalSamplesProcessed * 1_000_000L) / sampleRate
+                
+                mediaCodec?.queueInputBuffer(inputIdx, 0, shortsToPut * 2, ptsUs, 0)
+                
+                totalSamplesProcessed += shortsToPut
+                offset += shortsToPut
+            } else {
+                Log.w(TAG, "Encoder busy, skipping chunk at offset $offset")
+                break
+            }
+        }
+    }
+
+    private fun drainOutput(info: MediaCodec.BufferInfo, isEos: Boolean = false) {
+        if (isEos) {
+            val inputIdx = mediaCodec?.dequeueInputBuffer(5000) ?: -1
+            if (inputIdx >= 0) {
+                mediaCodec?.queueInputBuffer(inputIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+            }
+        }
+
+        var outputIdx = mediaCodec?.dequeueOutputBuffer(info, 0) ?: -1
+        while (outputIdx >= 0) {
+            val encodedData = mediaCodec?.getOutputBuffer(outputIdx)
+            if (encodedData != null && info.size > 0) {
+                val packetSize = info.size + 7
+                if (writeBuffer.remaining() < packetSize) {
+                    flushBuffer(forceSync = false)
+                }
+                fillADTSHeader(adtsHeaderBuffer, packetSize)
+                writeBuffer.put(adtsHeaderBuffer)
+                writeBuffer.put(encodedData)
+            }
+            mediaCodec?.releaseOutputBuffer(outputIdx, false)
+            outputIdx = mediaCodec?.dequeueOutputBuffer(info, 0) ?: -1
+        }
+    }
+
+    private fun flushBuffer(forceSync: Boolean) {
+        try {
             if (writeBuffer.position() > 0) {
                 writeBuffer.flip()
                 val written = fileChannel?.write(writeBuffer) ?: 0
                 _bytesWrittenToFile += written
                 writeBuffer.clear()
+                if (forceSync) {
+                    fileChannel?.force(false)
+                }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Error sending/draining EOS", e)
+            Log.e(TAG, "Flush error", e)
         }
     }
-    
-    /**
-     *  Fills the ADTS header into the provided byte array.
-     */
+
     private fun fillADTSHeader(packet: ByteArray, packetLen: Int) {
-        val profile = 2 // LC
-        val freqIdx = when (sampleRate) {
-            SAMPLE_RATE_16K -> 8
-            SAMPLE_RATE_44K -> 4
-            SAMPLE_RATE_48K -> 3
-            else -> 8 
-        }
-        val chanCfg = 1 
+        val freqIdx = when (sampleRate) { 16000 -> 8; 44100 -> 4; 48000 -> 3; else -> 8 }
         packet[0] = 0xFF.toByte()
         packet[1] = 0xF9.toByte()
-        // chanCfg is 1. (1 shr 2) is 0.
-        packet[2] = (((profile - 1) shl 6) or (freqIdx shl 2)).toByte()
-        
-        packet[3] = (((chanCfg and 3) shl 6) + (packetLen shr 11)).toByte()
+        packet[2] = (((2 - 1) shl 6) or (freqIdx shl 2)).toByte()
+        packet[3] = ((1 shl 6) + (packetLen shr 11)).toByte()
         packet[4] = ((packetLen and 0x7FF) shr 3).toByte()
         packet[5] = (((packetLen and 7) shl 5) + 0x1F).toByte()
         packet[6] = 0xFC.toByte()
     }
 
     private fun requestAudioFocus(): Boolean {
-        val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-            )
-            .setAcceptsDelayedFocusGain(false)
+        val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+            .setAudioAttributes(AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build())
+            .setAcceptsDelayedFocusGain(true)
             .setOnAudioFocusChangeListener { focusChange ->
                 when (focusChange) {
                     AudioManager.AUDIOFOCUS_LOSS,
-                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
                         synchronized(this) {
                             if (isRecording && !isPaused) {
                                 isPausedByFocus = true
                                 pause()
+                                stateListener?.onRecordingStateChanged(true)
+                                remoteLogger.info(TAG, "Audio focus lost: Auto-paused")
                             }
                         }
                     }
@@ -575,139 +445,74 @@ class VoiceRecorder(private val context: Context) {
                             if (isRecording && isPausedByFocus) {
                                 resume()
                                 isPausedByFocus = false
+                                stateListener?.onRecordingStateChanged(false)
+                                remoteLogger.info(TAG, "Audio focus regained: Auto-resumed")
                             }
                         }
                     }
                 }
-            }
-            .build()
-        
+            }.build()
+            
         audioFocusRequest = focusRequest
         val result = audioManager?.requestAudioFocus(focusRequest) ?: AudioManager.AUDIOFOCUS_REQUEST_FAILED
         return result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-    }
-
-    private fun abandonAudioFocus() {
-        audioFocusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
     }
 
     fun pause() {
         if (isRecording && !isPaused) {
             isPaused = true
             _accumulatedTime += System.currentTimeMillis() - _startTime
-            try {
-                audioRecord?.stop()
-            } catch (e: Exception) {
-                // Log but don't crash on stop failure
-                Log.w(TAG, "Error stopping audio record on pause", e)
-            }
+            flushBuffer(forceSync = true)
+            try { audioRecord?.stop() } catch (_: Exception) {}
         }
     }
 
     fun resume() {
         if (isRecording && isPaused) {
             try {
-                if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
-                     audioRecord?.startRecording()
-                }
+                audioRecord?.startRecording()
                 isPaused = false
                 _startTime = System.currentTimeMillis()
-            } catch (e: Exception) {
-                Log.e(TAG, "Error resuming recording", e)
-                stop("Resume Failed") 
-            }
+            } catch (_: Exception) {}
         }
     }
 
-    // Updated stop method to accept reason
-    fun stop(reason: String = "User Action") {
-        _isRecording.set(false)
-        cleanupReason = reason // Store reason for cleanup
-    }
-    
-    // Store cleanup reason if stop is called asynchronously
-    @Volatile
-    private var cleanupReason = "Unknown"
-    
-    fun release() {
-        stop("App Released")
-        recorderScope.cancel()
-    }
-
-    suspend fun stopRecording(reason: String = "User Action") {
-        stop(reason)
-        recordingJob?.join()
-    }
+    fun stop(reason: String = "User Action") { _isRecording.set(false) }
+    fun release() { stop("Release"); recorderScope.cancel() }
+    suspend fun stopRecording(reason: String = "User Action") { stop(reason); recordingJob?.join() }
     
     private fun cleanup(reason: String? = null) {
         _isRecording.set(false)
-        isPaused = false
-        
         releaseMediaComponents()
-        
-        // Flush and close stream
-        try {
-            if (writeBuffer.position() > 0) {
-                writeBuffer.flip()
-                val written = fileChannel?.write(writeBuffer) ?: 0
-                _bytesWrittenToFile += written
-            }
-        } catch (e: Exception) { Log.e(TAG, "Error flushing buffer on cleanup", e) }
-        
+        flushBuffer(forceSync = true) 
         try { fileChannel?.close() } catch (_: Exception) {}
-        fileChannel = null
         try { outputStream?.close() } catch (_: Exception) {}
-        outputStream = null
-        
-        try { abandonAudioFocus() } catch (_: Exception) {}
-        
+        audioFocusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
         safeReleaseWakeLock()
-        
-        currentFile = null
-        _accumulatedTime = 0L
-        _startTime = 0L
-        _bytesWrittenToFile = 0L
-        
-        val finalReason = reason ?: cleanupReason
-        remoteLogger.info(TAG, "Recording STOPPED ($finalReason) at ${System.currentTimeMillis()}")
-        Log.d(TAG, "Cleanup complete: $finalReason")
+        preRollBuffer = null
     }
 
     private fun releaseMediaComponents() {
-        try { mediaCodec?.stop() } catch (_: Exception) {}
-        try { mediaCodec?.release() } catch (_: Exception) {}
+        try { mediaCodec?.stop(); mediaCodec?.release() } catch (_: Exception) {}
         mediaCodec = null
-        
-        try { audioRecord?.stop() } catch (_: Exception) {}
-        try { audioRecord?.release() } catch (_: Exception) {}
+        try { audioRecord?.stop(); audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
     }
     
-    private fun safeReleaseWakeLock() {
-        try {
-            if (wakeLock?.isHeld == true) wakeLock.release()
-        } catch (e: Exception) {
-            Log.e(TAG, "WakeLock release failed", e)
-        }
-    }
+    private fun safeReleaseWakeLock() { if (wakeLock?.isHeld == true) wakeLock.release() }
 
     companion object {
         private const val TAG = "VoiceRecorder"
-        private const val WAKELOCK_TAG = "TalkToTheHand:RecordingWakeLock"
-        private const val WAKELOCK_TIMEOUT_MS = 10 * 60 * 60 * 1000L // 10 hours
+        private const val WAKELOCK_TAG = "TalkToTheHand:RecWakeLock"
+        private const val WAKELOCK_TIMEOUT_MS = 10 * 60 * 60 * 1000L
         private const val SAMPLE_RATE_16K = 16000
         private const val SAMPLE_RATE_44K = 44100
         private const val SAMPLE_RATE_48K = 48000
-        private const val MIN_BUFFER_SIZE = 4096
-        private const val OPTIMAL_BUFFER_SIZE = 65536 // Increased to 64KB for Max Battery Savings
-        private const val MAX_BUFFER_SIZE = 131072 // Increased max buffer too
-        private const val WRITE_BUFFER_SIZE = 131072 // Increased to 128KB for write batching
-        private const val SILENCE_HOLD_MS = 1000L
-        private const val PAUSE_SLEEP_MS = 100L
-        private const val EMPTY_READ_SLEEP_MS = 5L
-        private const val DEQUEUE_TIMEOUT_US = 5000L
-        private const val EOS_TIMEOUT_US = 10000L
-        private const val BASE_BACKOFF_DELAY_MS = 500L
-        private const val MAX_BACKOFF_DELAY_MS = 10000L
+        private const val OPTIMAL_BUFFER_SIZE = 16384 
+        private const val PRE_ROLL_MS = 800L 
+        private const val SILENCE_HOLD_MS = 1000L 
+        private const val DEEP_SILENCE_THRESHOLD_MS = 10000L 
+        private const val BASE_DUTY_CYCLE_DELAY_MS = 1000L 
+        private const val MAX_DUTY_CYCLE_DELAY_MS = 30000L 
     }
 }

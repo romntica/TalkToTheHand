@@ -2,64 +2,63 @@ package com.jinn.talktothehand.presentation
 
 import java.io.File
 import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
- * Manages a session lock file to detect ungraceful shutdowns.
- *
- * This class abstracts the file I/O for creating and deleting a lock file,
- * exposing a simple property-based API for checking and managing the lock state.
+ * Manages a session lock file to detect ungraceful shutdowns and support recovery.
  */
 class SessionLock(filesDir: File) {
 
     private val lockFile = File(filesDir, ".recording_session.lock")
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
 
-    /**
-     * A property to check if a session is currently locked (i.e., the lock file exists).
-     * Reading this property directly checks the file system.
-     */
     val isLocked: Boolean
         get() = lockFile.exists()
 
     /**
-     * Creates the lock file and writes the reason for starting the session.
-     * @param reason A description of why the session started (e.g., "User Action").
-     * @return True if the lock was successfully created, false otherwise.
+     * Locks the session and records the current file path for recovery.
      */
-    fun lock(reason: String): Boolean {
+    fun lock(reason: String, lastFilePath: String? = null): Boolean {
         return try {
-            val lockContent = "Started at: ${System.currentTimeMillis()}, Reason: $reason"
+            val startTime = dateFormat.format(Date())
+            val lockContent = buildString {
+                append("Status: ACTIVE\n")
+                append("Started: $startTime\n")
+                append("Reason: $reason\n")
+                append("LastTick: $startTime\n")
+                lastFilePath?.let { append("LastFile: $it\n") }
+            }
             lockFile.writeText(lockContent)
             true
         } catch (e: IOException) {
-            // In a production app, you might inject a logger here.
             e.printStackTrace()
             false
         }
     }
 
-    /**
-     * Deletes the lock file, signifying a clean shutdown.
-     */
-    fun unlock() {
-        if (isLocked) {
-            lockFile.delete()
-        }
+    fun updateTick() {
+        if (!isLocked) return
+        try {
+            val lines = lockFile.readLines().toMutableList()
+            val now = dateFormat.format(Date())
+            val idx = lines.indexOfFirst { it.startsWith("LastTick:") }
+            if (idx != -1) lines[idx] = "LastTick: $now"
+            lockFile.writeText(lines.joinToString("\n"))
+        } catch (_: Exception) {}
     }
 
-    /**
-     * Reads the content of the lock file, if it exists.
-     * @return The content of the lock file, or null if it doesn't exist or cannot be read.
-     */
-    fun readLockReason(): String? {
-        return if (isLocked) {
-            try {
-                lockFile.readText()
-            } catch (e: IOException) {
-                e.printStackTrace()
-                "Could not read lock file reason."
-            }
-        } else {
-            null
-        }
+    fun getLastFilePath(): String? {
+        if (!isLocked) return null
+        return try {
+            lockFile.readLines().find { it.startsWith("LastFile:") }?.substringAfter("LastFile: ")
+        } catch (_: Exception) { null }
     }
+
+    fun unlock() {
+        if (isLocked) lockFile.delete()
+    }
+
+    fun readLockReason(): String? = if (isLocked) lockFile.readText() else null
 }
