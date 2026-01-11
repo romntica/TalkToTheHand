@@ -12,15 +12,13 @@ android {
         applicationId = "com.jinn.talktothehand"
         minSdk = 30
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.1.2"
+        versionCode = 5
+        versionName = "1.2.0"
 
     }
 
-    // Added signingConfigs to allow building release variant with debug key
     signingConfigs {
         getByName("debug") { 
-            // This is the default location for the debug keystore and is portable
             storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
         }
     }
@@ -32,7 +30,6 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // Point release builds to the debug signing config
             signingConfig = signingConfigs.getByName("debug")
         }
     }
@@ -64,6 +61,10 @@ dependencies {
     implementation(libs.androidx.core.splashscreen)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.compose.material.icons.extended)
+    
+    implementation("androidx.wear.watchface:watchface-complications-data-source:1.2.1")
+    implementation("androidx.wear.watchface:watchface-complications-data:1.2.1")
+
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.tooling)

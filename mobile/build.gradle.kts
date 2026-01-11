@@ -11,8 +11,8 @@ android {
         applicationId = "com.jinn.talktothehand"
         minSdk = 33
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.1.1"
+        versionCode = 5
+        versionName = "1.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

@@ -7,7 +7,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -32,6 +31,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -48,17 +48,23 @@ import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
 import androidx.wear.compose.material.TimeText
 import com.jinn.talktothehand.presentation.theme.TalkToTheHandTheme
+import kotlinx.coroutines.delay
 
+/**
+ * Main Activity for Wear OS voice recorder.
+ */
 class MainActivity : ComponentActivity() {
 
-    @SuppressLint("InvalidFragmentVersionForActivityResult")
     private val requestPermissionLauncher =
         registerForActivityResult(
             ActivityResultContracts.RequestPermission()
         ) { isGranted: Boolean ->
             if (!isGranted) {
-                // Explain to the user that the feature is unavailable because the
-                // features requires a permission that the user has denied.
+                Toast.makeText(
+                    this,
+                    "Microphone permission is required.",
+                    Toast.LENGTH_LONG
+                ).show()
             }
         }
 
@@ -67,10 +73,16 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             WearApp(
+                intent = intent,
                 checkPermission = { checkPermission() },
                 requestPermission = { requestPermission() }
             )
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
     }
     
     private fun checkPermission(): Boolean {
@@ -83,29 +95,44 @@ class MainActivity : ComponentActivity() {
     private fun requestPermission() {
         requestPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
     }
+
+    companion object {
+        const val ACTION_QUICK_RECORD = "com.jinn.talktothehand.action.QUICK_RECORD"
+    }
 }
 
 @Composable
 fun WearApp(
+    intent: Intent?,
     viewModel: RecorderViewModel = viewModel(),
     checkPermission: () -> Boolean,
     requestPermission: () -> Unit
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
+    
+    LaunchedEffect(intent?.action) {
+        if (intent?.action == MainActivity.ACTION_QUICK_RECORD) {
+            intent.action = null
+            delay(500)
+            if (viewModel.isRecording) {
+                viewModel.stopRecording()
+            } else {
+                if (checkPermission()) viewModel.startRecording() else requestPermission()
+            }
+        }
+    }
+
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                if (viewModel.isRecording) {
-                    viewModel.startUiUpdates()
-                }
+                viewModel.refreshState()
+                if (viewModel.isRecording) viewModel.startUiUpdates()
             } else if (event == Lifecycle.Event.ON_PAUSE) {
                 viewModel.stopUiUpdates()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-        }
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
     
     val context = LocalContext.current
@@ -113,22 +140,14 @@ fun WearApp(
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 val requiresRestart = intent.getBooleanExtra(ConfigListenerService.EXTRA_REQUIRES_RESTART, false)
-                if (requiresRestart) {
-                    if (viewModel.isRecording) {
-                        Toast.makeText(context, "Applying new audio settings...", Toast.LENGTH_SHORT).show()
-                        viewModel.restartRecordingSession()
-                    } else {
-                        Toast.makeText(context, "Audio settings updated", Toast.LENGTH_SHORT).show()
-                    }
+                if (requiresRestart && viewModel.isRecording) {
+                    viewModel.restartRecordingSession()
                 }
             }
         }
         val filter = IntentFilter(ConfigListenerService.ACTION_CONFIG_CHANGED)
         ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
-        
-        onDispose {
-            context.unregisterReceiver(receiver)
-        }
+        onDispose { context.unregisterReceiver(receiver) }
     }
 
     TalkToTheHandTheme {
@@ -149,11 +168,7 @@ fun WearApp(
                     StartRecordingScreen(
                         isBusy = viewModel.isBusy,
                         onStartClick = {
-                            if (checkPermission()) {
-                                viewModel.startRecording()
-                            } else {
-                                requestPermission()
-                            }
+                            if (checkPermission()) viewModel.startRecording() else requestPermission()
                         }
                     )
                 } else {
@@ -161,6 +176,7 @@ fun WearApp(
                         isBusy = viewModel.isBusy,
                         formattedTime = viewModel.getFormattedTime(),
                         fileSize = viewModel.fileSizeString,
+                        chunkCount = viewModel.sessionChunkCount,
                         isPaused = viewModel.isPaused,
                         onPauseClick = { viewModel.pauseRecording() },
                         onResumeClick = { viewModel.resumeRecording() },
@@ -169,32 +185,8 @@ fun WearApp(
                 }
             }
             
-            val errorMessage = viewModel.errorMessage
-            if (errorMessage != null) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(MaterialTheme.colors.background.copy(alpha = 0.8f))
-                        .padding(16.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(
-                            text = "Error",
-                            style = MaterialTheme.typography.title2,
-                            color = MaterialTheme.colors.error
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = errorMessage,
-                            textAlign = TextAlign.Center
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Button(onClick = { viewModel.dismissError() }) {
-                            Text("Dismiss")
-                        }
-                    }
-                }
+            viewModel.errorMessage?.let { msg ->
+                ErrorOverlay(message = msg, onDismiss = { viewModel.dismissError() })
             }
         }
     }
@@ -204,7 +196,7 @@ fun WearApp(
 fun StartRecordingScreen(isBusy: Boolean, onStartClick: () -> Unit) {
     Button(
         onClick = onStartClick,
-        enabled = !isBusy, // Disable button when busy
+        enabled = !isBusy,
         modifier = Modifier.size(64.dp)
     ) {
         Icon(
@@ -214,7 +206,7 @@ fun StartRecordingScreen(isBusy: Boolean, onStartClick: () -> Unit) {
         )
     }
     Spacer(modifier = Modifier.height(8.dp))
-    Text(text = "Tap to Record")
+    Text(text = "Quick Record", style = MaterialTheme.typography.caption1)
 }
 
 @Composable
@@ -222,23 +214,23 @@ fun RecordingScreen(
     isBusy: Boolean,
     formattedTime: String,
     fileSize: String,
+    chunkCount: Int,
     isPaused: Boolean,
     onPauseClick: () -> Unit,
     onResumeClick: () -> Unit,
     onStopClick: () -> Unit
 ) {
+    Text(text = formattedTime, style = MaterialTheme.typography.display3, textAlign = TextAlign.Center)
+    
+    // Chunk Count Display
     Text(
-        text = formattedTime,
-        style = MaterialTheme.typography.display3,
-        textAlign = TextAlign.Center
+        text = "Completed Chunks: $chunkCount", 
+        style = MaterialTheme.typography.caption2, 
+        color = MaterialTheme.colors.primary
     )
-    Spacer(modifier = Modifier.height(4.dp))
-    Text(
-        text = fileSize,
-        style = MaterialTheme.typography.body1,
-        color = MaterialTheme.colors.secondary
-    )
-    Spacer(modifier = Modifier.height(16.dp))
+    
+    Text(text = fileSize, style = MaterialTheme.typography.body1, color = MaterialTheme.colors.secondary)
+    Spacer(modifier = Modifier.height(12.dp))
     
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -253,11 +245,28 @@ fun RecordingScreen(
                 Icon(Icons.Default.Pause, contentDescription = "Pause")
             }
         }
-        
         Spacer(modifier = Modifier.width(16.dp))
-        
         Button(onClick = onStopClick, enabled = !isBusy) {
             Icon(Icons.Default.Stop, contentDescription = "Stop")
+        }
+    }
+}
+
+@Composable
+fun ErrorOverlay(message: String, onDismiss: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colors.background.copy(alpha = 0.9f))
+            .padding(16.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(text = "Error", color = MaterialTheme.colors.error, style = MaterialTheme.typography.title2)
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(text = message, textAlign = TextAlign.Center)
+            Spacer(modifier = Modifier.height(16.dp))
+            Button(onClick = onDismiss) { Text("Dismiss") }
         }
     }
 }

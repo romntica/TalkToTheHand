@@ -8,8 +8,8 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.text.format.Formatter
-import android.util.Log
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -22,19 +22,17 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
 import java.util.concurrent.TimeUnit
 
 /**
- * Wear OS Recorder ViewModel - Display and UI Command only.
- * 
- * Logic follows the Command Pattern via Intents to VoiceRecorderService.
- * UI updates are sticky to handle transient recording pauses during chunk splits.
+ * Wear OS Recorder ViewModel.
+ * Refreshes UI at a stable 1-second interval to balance responsiveness and system load.
  */
 class RecorderViewModel(application: Application) : AndroidViewModel(application) {
 
     private val serviceConnection = RecorderServiceConnection(application)
     private var activeRecorder: VoiceRecorder? = null
+    private val config = RecorderConfig(application)
     
     // --- UI States ---
     var isRecording by mutableStateOf(false)
@@ -44,6 +42,8 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     var elapsedTimeMillis by mutableLongStateOf(0L)
         private set
     var fileSizeString by mutableStateOf("0 MB")
+        private set
+    var sessionChunkCount by mutableIntStateOf(0)
         private set
     var errorMessage by mutableStateOf<String?>(null)
         private set
@@ -58,8 +58,10 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             serviceConnection.recorderFlow.collectLatest { recorder ->
                 activeRecorder = recorder
-                setupRecorderListener(recorder)
-                updateStateFromRecorder(recorder)
+                if (recorder != null) {
+                    setupRecorderListener(recorder)
+                    syncStateWithService()
+                }
             }
         }
         
@@ -68,10 +70,10 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    private fun setupRecorderListener(recorder: VoiceRecorder?) {
-        recorder?.stateListener = object : VoiceRecorder.StateListener {
+    private fun setupRecorderListener(recorder: VoiceRecorder) {
+        recorder.stateListener = object : VoiceRecorder.StateListener {
             override fun onRecordingStateChanged(paused: Boolean) {
-                viewModelScope.launch(Dispatchers.Main) { isPaused = paused }
+                isPaused = paused
             }
             override fun onError(message: String) {
                 viewModelScope.launch(Dispatchers.Main) {
@@ -82,11 +84,26 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    private fun updateStateFromRecorder(recorder: VoiceRecorder?) {
-        if (recorder != null && recorder.isRecording) {
+    /**
+     * Actively refreshes the state. Called on app resume.
+     */
+    fun refreshState() {
+        syncStateWithService()
+    }
+
+    private fun syncStateWithService() {
+        val recorder = activeRecorder
+        val isServiceActive = (recorder != null && recorder.isRecording) || config.isRecording
+        
+        if (isServiceActive) {
             isRecording = true
-            isPaused = recorder.isPaused
+            isPaused = recorder?.isPaused ?: false
+            sessionChunkCount = config.sessionChunkCount
             startUiUpdates()
+        } else if (isRecording) {
+            isRecording = false
+            stopUiUpdates()
+            resetUIState()
         }
     }
 
@@ -97,6 +114,8 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         
         viewModelScope.launch {
             try {
+                // Buffer for hardware stabilization
+                delay(500)
                 withContext(Dispatchers.IO) {
                     val context = getApplication<Application>()
                     val intent = Intent(context, VoiceRecorderService::class.java).apply {
@@ -105,6 +124,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     context.startForegroundService(intent)
                 }
                 vibrate(VIBRATION_SHORT)
+                syncStateWithService()
             } catch (e: Exception) {
                 errorMessage = "Start failed: ${e.message}"
                 vibrate(VIBRATION_ERROR)
@@ -116,7 +136,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun stopRecording() {
-        if (isBusy || !isRecording) return
+        if (isBusy) return
         isBusy = true
         
         viewModelScope.launch {
@@ -128,26 +148,22 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     }
                     context.startService(intent)
                 }
-                stopUiUpdates()
-                resetUIState()
                 vibrate(VIBRATION_DOUBLE)
+                syncStateWithService()
             } catch (e: Exception) {
                 errorMessage = "Stop error: ${e.message}"
             } finally {
+                delay(500)
                 isBusy = false
             }
         }
     }
 
-    /**
-     * Restarts the session via Service.
-     */
     fun restartRecordingSession() {
         if (isBusy || !isRecording) return
         viewModelScope.launch {
             isBusy = true
             try {
-                // Just trigger restart via intent sequence
                 stopRecording()
                 delay(1000)
                 startRecording()
@@ -162,6 +178,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         isPaused = false
         elapsedTimeMillis = 0
         fileSizeString = "0 MB"
+        sessionChunkCount = 0
     }
 
     fun pauseRecording() { activeRecorder?.pause() }
@@ -170,26 +187,25 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     fun startUiUpdates() {
         if (uiUpdateJob?.isActive == true) return
         uiUpdateJob = viewModelScope.launch(Dispatchers.Main) { 
-            var nullCounter = 0
             while (isActive) {
                 val recorder = activeRecorder
                 
+                // Refresh logic once per second
                 if (recorder != null && recorder.isRecording) {
-                    nullCounter = 0
                     isRecording = true
                     isPaused = recorder.isPaused
                     elapsedTimeMillis = recorder.durationMillis
                     fileSizeString = Formatter.formatFileSize(getApplication(), recorder.currentFileSize)
+                    sessionChunkCount = config.sessionChunkCount
+                } else if (config.isRecording) {
+                    isRecording = true
+                    fileSizeString = Formatter.formatFileSize(getApplication(), config.currentChunkSizeBytes)
+                    sessionChunkCount = config.sessionChunkCount
                 } else {
-                    // Sticky UI: If recorder is null or not recording, wait up to 3 seconds
-                    // before giving up. This prevents flicker during chunk splits.
-                    nullCounter++
-                    if (nullCounter > 3 && isRecording) {
-                        isRecording = false
-                        break
-                    }
+                    isRecording = false
+                    break
                 }
-                delay(1000)
+                delay(1000) 
             }
         }
     }
@@ -224,7 +240,6 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     }
     
     companion object {
-        private const val TAG = "RecorderViewModel"
         private val VIBRATION_SHORT = VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE)
         private val VIBRATION_DOUBLE = VibrationEffect.createWaveform(longArrayOf(0, 50, 50, 50), -1)
         private val VIBRATION_ERROR = VibrationEffect.createOneShot(500, VibrationEffect.DEFAULT_AMPLITUDE)

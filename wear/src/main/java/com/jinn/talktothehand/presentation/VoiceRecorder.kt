@@ -34,12 +34,7 @@ import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
- * Advanced Voice Recorder with Precise PTS (Presentation Time Stamp) Management.
- * 
- * Features:
- * - Chunked Encoding: Safely feeds data to MediaCodec.
- * - Accurate PTS: Calculates timestamps based on samples to prevent "overlapping timestamp" errors.
- * - Pre-roll (800ms) & Post-roll (1000ms): Prevents audio clipping.
+ * Advanced Voice Recorder with Precise PTS Management.
  */
 class VoiceRecorder(private val context: Context) {
 
@@ -79,13 +74,14 @@ class VoiceRecorder(private val context: Context) {
 
     private var _startTime = 0L
     private var _accumulatedTime = 0L
+    private var _finalDuration = 0L // Stores duration after stop
     
     @Volatile
     private var _bytesWrittenToFile = 0L
 
     val durationMillis: Long
         get() {
-            if (!_isRecording.get()) return 0L
+            if (!_isRecording.get()) return _finalDuration
             val currentSession = if (!isPaused) System.currentTimeMillis() - _startTime else 0L
             return _accumulatedTime + currentSession
         }
@@ -110,15 +106,9 @@ class VoiceRecorder(private val context: Context) {
     private val adtsHeaderByteBuffer = ByteBuffer.wrap(adtsHeaderBuffer)
     private val writeBuffer = ByteBuffer.allocateDirect(16384)
 
-    // --- VAD & Timing State ---
     private var preRollBuffer: ShortArray? = null
     private var isPreRollFlushed = false
     private var currentDutyCycleDelayMs = BASE_DUTY_CYCLE_DELAY_MS
-    
-    /**
-     * Accurate tracking of samples processed in the current file session.
-     * Used to calculate monotonic Presentation Time Stamps (PTS).
-     */
     private var totalSamplesProcessed = 0L
 
     fun start(outputFile: File, reason: String = "Unknown"): Boolean {
@@ -148,10 +138,10 @@ class VoiceRecorder(private val context: Context) {
         currentFile = outputFile
         _startTime = System.currentTimeMillis()
         _accumulatedTime = 0L
+        _finalDuration = 0L
         _bytesWrittenToFile = 0L
         writeBuffer.clear()
         
-        // --- Reset Timing State for New Session ---
         totalSamplesProcessed = 0L
         currentDutyCycleDelayMs = BASE_DUTY_CYCLE_DELAY_MS 
         isPreRollFlushed = false
@@ -177,6 +167,7 @@ class VoiceRecorder(private val context: Context) {
                 lastError = "Recording error: ${e.message}"
                 stateListener?.onError(lastError ?: "Unknown error")
             } finally {
+                _finalDuration = durationMillis // Capture final duration before full cleanup
                 cleanup(reason = "Finished/Error")
             }
         }
@@ -335,10 +326,6 @@ class VoiceRecorder(private val context: Context) {
         }
     }
 
-    /**
-     * Robust encoding with Precise PTS.
-     * Splits large buffers into encoder-compatible chunks and assigns accurate timestamps.
-     */
     private fun processEncodingRobust(buffer: ShortArray, readSize: Int) {
         var offset = 0
         while (offset < readSize) {
@@ -351,11 +338,7 @@ class VoiceRecorder(private val context: Context) {
                 val shortsToPut = min(readSize - offset, maxShorts)
                 
                 inputBuffer.asShortBuffer().put(buffer, offset, shortsToPut)
-                
-                // CALCULATE PTS: Based on accumulated samples. 
-                // Formula: (TotalSamples * 1,000,000) / SampleRate
                 val ptsUs = (totalSamplesProcessed * 1_000_000L) / sampleRate
-                
                 mediaCodec?.queueInputBuffer(inputIdx, 0, shortsToPut * 2, ptsUs, 0)
                 
                 totalSamplesProcessed += shortsToPut
@@ -436,7 +419,6 @@ class VoiceRecorder(private val context: Context) {
                                 isPausedByFocus = true
                                 pause()
                                 stateListener?.onRecordingStateChanged(true)
-                                remoteLogger.info(TAG, "Audio focus lost: Auto-paused")
                             }
                         }
                     }
@@ -446,7 +428,6 @@ class VoiceRecorder(private val context: Context) {
                                 resume()
                                 isPausedByFocus = false
                                 stateListener?.onRecordingStateChanged(false)
-                                remoteLogger.info(TAG, "Audio focus regained: Auto-resumed")
                             }
                         }
                     }
@@ -477,7 +458,13 @@ class VoiceRecorder(private val context: Context) {
         }
     }
 
-    fun stop(reason: String = "User Action") { _isRecording.set(false) }
+    fun stop(reason: String = "User Action") { 
+        if (_isRecording.get()) {
+            _finalDuration = durationMillis // Capture before setting state to false
+            _isRecording.set(false) 
+        }
+    }
+    
     fun release() { stop("Release"); recorderScope.cancel() }
     suspend fun stopRecording(reason: String = "User Action") { stop(reason); recordingJob?.join() }
     

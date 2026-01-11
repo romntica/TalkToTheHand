@@ -5,13 +5,19 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.text.format.DateFormat
 import androidx.core.app.NotificationCompat
+import androidx.wear.watchface.complications.datasource.ComplicationDataSourceUpdateRequester
 import com.jinn.talktothehand.R
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -23,10 +29,11 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.util.Date
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Wear OS Foreground Service for persistent recording and background chunk management.
- * Optimized for resilience during chunk handovers.
+ * Wear OS Foreground Service for persistent voice recording.
+ * Fixed: Mono-timestamp race condition for short/finalized chunks.
  */
 class VoiceRecorderService : Service() {
 
@@ -34,6 +41,7 @@ class VoiceRecorderService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var monitorJob: Job? = null
     private var isSplitting = false
+    private val isProcessingAction = AtomicBoolean(false)
     
     var recorder: VoiceRecorder? = null
         private set
@@ -65,19 +73,44 @@ class VoiceRecorderService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
         
-        if (action == ACTION_START_FOREGROUND) {
-            startForegroundWithMicrophone()
-            if (recorder?.isRecording != true) {
-                startNewSession("User Action via Intent")
+        if (isProcessingAction.getAndSet(true)) return START_STICKY
+
+        serviceScope.launch {
+            try {
+                when (action) {
+                    ACTION_TOGGLE_RECORDING -> handleToggleAction()
+                    ACTION_START_FOREGROUND -> handleStartAction()
+                    ACTION_STOP_FOREGROUND -> stopRecordingAndForeground()
+                    null -> handleAutoRecovery()
+                }
+            } finally {
+                isProcessingAction.set(false)
             }
-            startMonitoring() // Ensure monitoring starts
-        } else if (action == ACTION_STOP_FOREGROUND) {
-            stopRecordingAndForeground()
-        } else if (intent == null) {
-            handleAutoRecovery()
         }
 
         return START_STICKY 
+    }
+
+    private suspend fun handleToggleAction() {
+        if (recorder?.isRecording == true || config.isRecording) {
+            vibrate(VIBRATION_STOP)
+            stopRecordingAndForeground()
+        } else {
+            vibrate(VIBRATION_START)
+            startForegroundWithMicrophone()
+            config.sessionChunkCount = 0
+            startNewSession("Toggle")
+            startMonitoring()
+        }
+    }
+
+    private fun handleStartAction() {
+        startForegroundWithMicrophone()
+        if (recorder?.isRecording != true) {
+            config.sessionChunkCount = 0
+            startNewSession("Manual")
+        }
+        startMonitoring()
     }
 
     fun startNewSession(reason: String): Boolean {
@@ -87,34 +120,29 @@ class VoiceRecorderService : Service() {
         sessionLock.lock(reason, file.absolutePath)
         val started = recorder?.start(file, reason) ?: false
         
-        if (!started) {
+        if (started) {
+            config.isRecording = true
+            updateComplications()
+        } else {
             sessionLock.unlock()
         }
         return started
     }
 
-    /**
-     * Resilient monitor loop. Does not exit during transient recording pauses (e.g., splitting).
-     */
     private fun startMonitoring() {
         if (monitorJob?.isActive == true) return
         monitorJob = serviceScope.launch {
             while (isActive) {
-                val rec = recorder
-                if (rec == null) break
-
-                // Pet the watchdog
+                val rec = recorder ?: break
                 sessionLock.updateTick()
 
-                // Only check for split if we are recording and NOT already in a split process
                 if (rec.isRecording && !isSplitting) {
+                    config.currentChunkSizeBytes = rec.currentFileSize
                     if (rec.currentFileSize >= config.maxChunkSizeBytes) {
-                        remoteLogger.info(TAG, "Chunk limit reached (${rec.currentFileSize} bytes). Splitting...")
                         performSplit()
                     }
+                    updateComplications()
                 }
-                
-                // Keep the loop alive even if isRecording is momentarily false during split
                 delay(MONITOR_INTERVAL_MS)
             }
         }
@@ -124,24 +152,14 @@ class VoiceRecorderService : Service() {
         val rec = recorder ?: return
         isSplitting = true
         try {
+            // CRITICAL: Capture data before stopping
             val duration = rec.durationMillis
             val oldFile = rec.currentFile
             
-            // 1. Stop current job (this is a suspend join)
-            rec.stopRecording("Chunk split")
+            rec.stopRecording("Split")
+            oldFile?.let { processFinalFile(it, duration) }
             
-            // 2. Finalize
-            oldFile?.let { file ->
-                val seconds = TimeUnit.MILLISECONDS.toSeconds(duration)
-                val timestamp = file.name.substringBefore("_temp")
-                val newFile = File(file.parent, "${timestamp}_${seconds}s.aac")
-                if (file.renameTo(newFile)) {
-                    fileTransferManager.transferFile(newFile)
-                }
-            }
-            
-            // 3. Start new session
-            startNewSession("Chunk split continuation")
+            startNewSession("Continuation")
         } finally {
             isSplitting = false
         }
@@ -150,16 +168,17 @@ class VoiceRecorderService : Service() {
     private fun handleAutoRecovery() {
         if (sessionLock.isLocked) {
             val lastFile = sessionLock.getLastFilePath()?.let { File(it) }
-            if (lastFile != null && lastFile.exists()) {
+            if (lastFile?.exists() == true) {
                 val recoveredFile = File(lastFile.parent, lastFile.name.replace("_temp", "_recovered"))
                 if (lastFile.renameTo(recoveredFile)) {
                     fileTransferManager.transferFile(recoveredFile)
+                    config.sessionChunkCount += 1
                 }
-                sessionLock.unlock()
-                startForegroundWithMicrophone()
-                startNewSession("Auto-Recovery Resumption")
-                startMonitoring()
             }
+            sessionLock.unlock()
+            startForegroundWithMicrophone()
+            startNewSession("Recovery")
+            startMonitoring()
         }
     }
 
@@ -169,7 +188,7 @@ class VoiceRecorderService : Service() {
 
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("TalkToTheHand: Active")
-            .setContentText("Continuous recording is protected.")
+            .setContentText("Recording...")
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
@@ -182,26 +201,51 @@ class VoiceRecorderService : Service() {
         }
     }
 
-    private fun stopRecordingAndForeground() {
+    private suspend fun stopRecordingAndForeground() {
+        config.isRecording = false
+        config.currentChunkSizeBytes = 0L
+        updateComplications()
+        
         monitorJob?.cancel()
-        serviceScope.launch {
-            recorder?.stopRecording("Stop Foreground Request")
-            finalizeOnStop()
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+        recorder?.let { 
+            val duration = it.durationMillis
+            val file = it.currentFile
+            it.stopRecording("Stop")
+            file?.let { f -> processFinalFile(f, duration) }
+        }
+        
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun processFinalFile(file: File, durationMillis: Long) {
+        if (durationMillis < MIN_VALID_DURATION_MS) {
+            if (file.exists()) file.delete()
+            return
+        }
+
+        val seconds = TimeUnit.MILLISECONDS.toSeconds(durationMillis)
+        val timestamp = file.name.substringBefore("_temp")
+        val newFile = File(file.parent, "${timestamp}_${seconds}s.aac")
+        
+        if (file.renameTo(newFile)) {
+            config.sessionChunkCount += 1
+            fileTransferManager.transferFile(newFile)
         }
     }
 
-    private fun finalizeOnStop() {
-        val rec = recorder ?: return
-        val file = rec.currentFile ?: return
-        if (file.exists()) {
-            val seconds = TimeUnit.MILLISECONDS.toSeconds(rec.durationMillis)
-            val timestamp = file.name.substringBefore("_temp")
-            val newFile = File(file.parent, "${timestamp}_${seconds}s.aac")
-            file.renameTo(newFile)
-            fileTransferManager.transferFile(newFile)
+    private fun updateComplications() {
+        val requester = ComplicationDataSourceUpdateRequester.create(this, ComponentName(this, RecordingProgressComplicationService::class.java))
+        requester.requestUpdateAll()
+        val quickRequester = ComplicationDataSourceUpdateRequester.create(this, ComponentName(this, QuickRecordIconComplicationService::class.java))
+        quickRequester.requestUpdateAll()
+    }
+
+    private fun vibrate(effect: VibrationEffect) {
+        val vibrator = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager else getSystemService(Context.VIBRATOR_SERVICE) as Vibrator).let {
+            if (it is VibratorManager) it.defaultVibrator else it as Vibrator
         }
+        if (vibrator.hasVibrator()) vibrator.vibrate(effect)
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -213,8 +257,14 @@ class VoiceRecorderService : Service() {
     
     companion object {
         private const val TAG = "VoiceRecorderService"
-        private const val MONITOR_INTERVAL_MS = 5000L // Increased frequency for better response
+        private const val MONITOR_INTERVAL_MS = 5000L
+        private const val MIN_VALID_DURATION_MS = 2000L
+        
         const val ACTION_START_FOREGROUND = "com.jinn.talktothehand.action.START_FOREGROUND"
         const val ACTION_STOP_FOREGROUND = "com.jinn.talktothehand.action.STOP_FOREGROUND"
+        const val ACTION_TOGGLE_RECORDING = "com.jinn.talktothehand.action.TOGGLE_RECORDING"
+        
+        private val VIBRATION_START = VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE)
+        private val VIBRATION_STOP = VibrationEffect.createWaveform(longArrayOf(0, 50, 50, 50), -1)
     }
 }

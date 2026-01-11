@@ -8,16 +8,19 @@ The app is architected for reliability, featuring background recording, resilien
 
 ## Features
 
-### ⌚ Wear OS App
+### ⌚ Wear OS App (v1.2.0 New ✨)
+*   **Advanced Watch Face Complications:**
+    *   **Quick Control:** Toggle recording start/stop directly from your watch face without opening the app.
+    *   **Live Progress Gauge:** A high-visibility segmented arc showing the current chunk's recording progress.
+    *   **Session Statistics:** Real-time display of the total number of chunks recorded in the current session.
+    *   **Seamless Integration:** Fully optimized for Android 14/15 restrictions using invisible bridge technology for instant background activation.
 *   **Resilient Recording:** Uses a **Foreground Service** to ensure recording continues if the app is backgrounded. Automatically recovers from hardware errors.
 *   **Advanced Power Saving:** Implements multiple strategies to maximize battery life:
     *   **Write Batching:** Minimizes power-hungry storage writes by using a small, efficient buffer with frequent fsyncs.
-    *   **CPU Gating:** Reduces CPU wake-ups by processing audio in efficient chunks.
-    *   **Configurable VAD:** Features a software-based Voice Activity Detection with a "Standard" mode (sleeps CPU) and an **"Aggressive" mode** (powers down the microphone)
+    *   **Configurable VAD:** Features a software-based Voice Activity Detection with a "Standard" mode and an **"Aggressive" mode** (with exponential backoff).
 *   **Crash-Proof Files:** Saves audio in a raw **ADTS AAC** format, ensuring files are always playable, even if the app crashes mid-recording.
-*   **Smart Storage Management:** Automatically stops when a configurable storage limit is reached.
-*   **Resilient File Transfer:** Uses `WorkManager` with an exponential backoff policy to reliably transfer recordings to the paired phone, automatically handling connection drops.
-*   **Haptic Feedback:** Provides tactile feedback for key events like start, stop, and errors.
+*   **Smart Storage Management:** Automatically stops when a configurable storage limit is reached and discards insignificant recordings (shorter than 2 seconds).
+*   **Resilient File Transfer:** Uses `WorkManager` with an exponential backoff policy to reliably transfer recordings to the paired phone.
 
 ### 📱 Mobile Companion App
 *   **Live Transfer Status:** Shows the real-time status of incoming file transfers.
@@ -29,60 +32,78 @@ The app is architected for reliability, featuring background recording, resilien
 
 *   **Language:** Kotlin
 *   **UI:** Jetpack Compose (Wear & Mobile)
-*   **Architecture:** MVVM-style with a Service layer
+*   **Architecture:** MVVM-style with a Service layer & Security Bridge
 *   **Concurrency:** Kotlin Coroutines & StateFlow
-*   **Background Work:**
-    *   `WorkManager` (File Transfer)
-    *   `ForegroundService` (Recording)
 *   **Connectivity:** Google Play Services Wearable Data Layer (`ChannelClient`, `MessageClient`)
 *   **Audio:** Android `AudioRecord` & `MediaCodec` (AAC/ADTS)
 
-## Architecture Overview
+## High-Level Architecture (v1.2.0)
 
-A simple text-based diagram of the key components:
+The system is designed with a multi-layered approach to bypass Android 14+ background microphone restrictions while maintaining a seamless user experience.
 
-```
-[ MainActivity (UI) ] <--> [ RecorderViewModel ] <--> [ RecorderServiceConnection ]
-       ^                                                       |
-       | (observes)                                            | (binds)
-       |                                                       v
-       |                                             [ VoiceRecorderService ]
-       |                                                       |
-       | (holds instance of)                                   v
-       +---------------------------------------------> [ VoiceRecorder ]
-                                                            (Core Logic: Mic, Codec, VAD, I/O)
+```mermaid
+graph TD
+    %% Watch Face Layer
+    subgraph WatchFace [Watch Face Layer]
+        C1[Quick Record Icon]
+        C2[Progress & Chunk Gauge]
+    end
+
+    %% Security Bridge Layer
+    subgraph BridgeLayer [Security Bridge - Android 14+]
+        TA[Transparent Service Launcher]
+        note1[Invisible Activity for<br/>Foreground Exemption]
+    end
+
+    %% Application Layer
+    subgraph AppUI [Application Layer]
+        MA[MainActivity - Compose]
+        VM[RecorderViewModel]
+        RC[RecorderConfig]
+    end
+
+    %% Core Service Layer
+    subgraph ServiceLayer [Core Service Layer]
+        VRS[VoiceRecorderService - Foreground]
+        VR[VoiceRecorder Engine]
+        SL[SessionLock - Watchdog]
+    end
+
+    %% Data Layer
+    subgraph DataSync [Data & Integration]
+        FTW[WorkManager - FileTransfer]
+        RL[RemoteLogger - Telemetry]
+    end
+
+    %% Interactions
+    C1 -. "Tap" .-> TA
+    C2 -. "Tap" .-> TA
+    TA -- "Toggle Intent" --> VRS
+    
+    MA <--> VM
+    VM -- "Bind" --> VRS
+    VM -- "Observe" --> RC
+    
+    VRS --> VR
+    VRS --> SL
+    VR -- "AAC Encode" --> Storage[(Storage)]
+    
+    VRS -- "Transfer" --> FTW
+    FTW -- "BT/WiFi" --> Phone[Mobile App]
+    RL -- "Log" --> Phone
 ```
 
 ## Downloads
 
-If you are not a developer and just want to use the app, you can download the latest pre-built APKs for your Android Phone and Wear OS Watch from the **[Releases Page](https://github.com/romntica/TalkToTheHand/releases)**.
+Latest pre-built APKs are available on the **[Releases Page](https://github.com/romntica/TalkToTheHand/releases)**.
 
-## Settings (v1.1.0+)
+## Settings (v1.2.0)
 
-1.  **Max Chunk Size:** The size of each audio file before it is split and a new one is created. Larger sizes reduce the frequency of Bluetooth transfers, saving battery.
-2.  **Max Storage:** The total storage space the app will use on the watch. Recording stops when this limit is reached.
-3.  **Bitrate & Sample Rate:** Standard audio quality settings.
-4.  **Silence Threshold:** The audio level required to trigger voice activity detection (VAD). See the recommendations below for tuning.
-
-    | Sound Example            | Typical Amplitude | Recorded?       |
-    | :----------------------- | :---------------- | :-------------- |
-    | Digital/Mic Noise Floor  | 10 - 300          | No              |
-    | A quiet whisper          | 800 - 1500        | **Yes**         |
-    | Normal talking voice     | 4,000 - 15,000    | **Yes**         |
-    | Nearby keyboard typing   | 1,500 - 3,000     | **Yes**         |
-
-    **Tuning Recommendations:**
-    *   **Quiet Room:** Start with the default `1000`.
-    *   **Noisy Office:** If the recording includes too much background noise or stops unexpectedly, try increasing to `1500` or `2000`.
-
-5.  **Silence Power Saving:** The strategy used to save battery during silent periods.
-    *   **Standard (Reliable):** Sleeps the CPU but keeps the microphone active. Good battery savings with zero risk of audio loss.
-    *   **Aggressive (Battery Saver):** Powers down the microphone during long silences. It utilizes an **exponential backoff** strategy (ranging from 1s up to 30s) to minimize system IPC overhead and battery drain. Offers the best battery life but may have a slight wake-up latency.
-    *   **Note : power saving efficiency of each policy could be depending on the device.**
-
-
-6.  **Auto-Start on Boot:** Automatically launches the app and begins recording (if configured) when the watch starts up.
-7.  **Telemetry:** Sends event and error logs with system metadata to the phone (`Downloads/TalkToTheHand/Logs`) for debugging.
+1.  **Max Chunk Size:** The size of each audio file before it is split.
+2.  **Silence Power Saving:** 
+    *   **Standard (Reliable):** Sleeps the CPU but keeps the microphone active.
+    *   **Aggressive (Battery Saver):** Powers down the microphone during long silences (10s threshold) with exponential backoff (1s up to 30s).
+3.  **Auto-Start on Boot:** Automatically starts the background listener on device power-up.
 
 ## License
 
