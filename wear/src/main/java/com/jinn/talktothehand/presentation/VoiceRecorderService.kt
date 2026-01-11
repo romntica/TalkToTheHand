@@ -33,7 +33,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Wear OS Foreground Service for persistent voice recording.
- * Fixed: Mono-timestamp race condition for short/finalized chunks.
  */
 class VoiceRecorderService : Service() {
 
@@ -51,6 +50,10 @@ class VoiceRecorderService : Service() {
     private lateinit var fileTransferManager: FileTransferManager
     private lateinit var config: RecorderConfig
     
+    // Caching system services for performance
+    private lateinit var vibrator: Vibrator
+    private lateinit var notificationManager: NotificationManager
+    
     private val CHANNEL_ID = "VoiceRecorderChannel"
     private val NOTIFICATION_ID = 101
     
@@ -67,12 +70,26 @@ class VoiceRecorderService : Service() {
         recorder = VoiceRecorder(applicationContext)
         fileTransferManager = FileTransferManager(applicationContext)
         
+        // Initialize and cache system services
+        notificationManager = getSystemService(NotificationManager::class.java)
+        vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vm = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+            vm.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        }
+        
         createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
         
+        if (action == ACTION_TOGGLE_RECORDING || action == ACTION_START_FOREGROUND || intent == null) {
+            startForegroundWithMicrophone()
+        }
+
         if (isProcessingAction.getAndSet(true)) return START_STICKY
 
         serviceScope.launch {
@@ -97,7 +114,6 @@ class VoiceRecorderService : Service() {
             stopRecordingAndForeground()
         } else {
             vibrate(VIBRATION_START)
-            startForegroundWithMicrophone()
             config.sessionChunkCount = 0
             startNewSession("Toggle")
             startMonitoring()
@@ -105,7 +121,6 @@ class VoiceRecorderService : Service() {
     }
 
     private fun handleStartAction() {
-        startForegroundWithMicrophone()
         if (recorder?.isRecording != true) {
             config.sessionChunkCount = 0
             startNewSession("Manual")
@@ -152,7 +167,6 @@ class VoiceRecorderService : Service() {
         val rec = recorder ?: return
         isSplitting = true
         try {
-            // CRITICAL: Capture data before stopping
             val duration = rec.durationMillis
             val oldFile = rec.currentFile
             
@@ -188,7 +202,7 @@ class VoiceRecorderService : Service() {
 
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("TalkToTheHand: Active")
-            .setContentText("Recording...")
+            .setContentText("Recording in progress...")
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
@@ -242,17 +256,16 @@ class VoiceRecorderService : Service() {
     }
 
     private fun vibrate(effect: VibrationEffect) {
-        val vibrator = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager else getSystemService(Context.VIBRATOR_SERVICE) as Vibrator).let {
-            if (it is VibratorManager) it.defaultVibrator else it as Vibrator
+        if (::vibrator.isInitialized && vibrator.hasVibrator()) {
+            vibrator.vibrate(effect)
         }
-        if (vibrator.hasVibrator()) vibrator.vibrate(effect)
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(CHANNEL_ID, "Voice Recorder", NotificationManager.IMPORTANCE_LOW)
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        notificationManager.createNotificationChannel(channel)
     }
     
     companion object {

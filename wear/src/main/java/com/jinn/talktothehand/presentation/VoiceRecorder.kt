@@ -20,10 +20,12 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
@@ -34,7 +36,8 @@ import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
- * Advanced Voice Recorder with Precise PTS Management.
+ * Advanced Voice Recorder with Interruptible Backoff and Enhanced VAD logic.
+ * Optimized for v1.2.0 Release using Stable Coroutine APIs.
  */
 class VoiceRecorder(private val context: Context) {
 
@@ -74,8 +77,12 @@ class VoiceRecorder(private val context: Context) {
 
     private var _startTime = 0L
     private var _accumulatedTime = 0L
-    private var _finalDuration = 0L // Stores duration after stop
+    private var _finalDuration = 0L
     
+    private val wakeLock = (context.getSystemService(Context.POWER_SERVICE) as? PowerManager)?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKELOCK_TAG)
+    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+    private var audioFocusRequest: AudioFocusRequest? = null
+
     @Volatile
     private var _bytesWrittenToFile = 0L
 
@@ -88,10 +95,6 @@ class VoiceRecorder(private val context: Context) {
         
     val currentFileSize: Long
         get() = _bytesWrittenToFile + writeBuffer.position()
-
-    private val wakeLock = (context.getSystemService(Context.POWER_SERVICE) as? PowerManager)?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKELOCK_TAG)
-    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-    private var audioFocusRequest: AudioFocusRequest? = null
 
     private val recorderScope = CoroutineScope(Dispatchers.IO + Job())
     private var recordingJob: Job? = null
@@ -110,6 +113,8 @@ class VoiceRecorder(private val context: Context) {
     private var isPreRollFlushed = false
     private var currentDutyCycleDelayMs = BASE_DUTY_CYCLE_DELAY_MS
     private var totalSamplesProcessed = 0L
+
+    private val wakeupSignal = Channel<Unit>(Channel.CONFLATED)
 
     fun start(outputFile: File, reason: String = "Unknown"): Boolean {
         if (isRecording || (recordingJob?.isActive == true)) return false
@@ -151,9 +156,9 @@ class VoiceRecorder(private val context: Context) {
                 outputStream = FileOutputStream(outputFile)
                 fileChannel = outputStream?.channel
 
-                if (!initializeHardware()) {
-                    lastError = "Initialization failed"
-                    stateListener?.onError(lastError ?: "Hardware init failed")
+                if (!initializeHardwareWithRetry()) {
+                    lastError = "Mic access failed"
+                    stateListener?.onError(lastError!!)
                     return@launch
                 }
                 
@@ -165,9 +170,9 @@ class VoiceRecorder(private val context: Context) {
             } catch (e: Exception) {
                 remoteLogger.error(TAG, "Recording session error", e)
                 lastError = "Recording error: ${e.message}"
-                stateListener?.onError(lastError ?: "Unknown error")
+                stateListener?.onError(lastError!!)
             } finally {
-                _finalDuration = durationMillis // Capture final duration before full cleanup
+                _finalDuration = durationMillis
                 cleanup(reason = "Finished/Error")
             }
         }
@@ -175,9 +180,32 @@ class VoiceRecorder(private val context: Context) {
         return true
     }
 
+    /**
+     * Triggers an immediate wakeup from power-saving backoff.
+     */
+    fun forceWakeup() {
+        wakeupSignal.trySend(Unit)
+    }
+
+    private suspend fun initializeHardwareWithRetry(): Boolean {
+        val startWaitTime = System.currentTimeMillis()
+        var attemptCount = 0
+        
+        while (System.currentTimeMillis() - startWaitTime < MIC_ACCESS_TIMEOUT_MS) {
+            attemptCount++
+            if (initializeHardware()) {
+                val testBuffer = ShortArray(1024)
+                val readResult = audioRecord?.read(testBuffer, 0, testBuffer.size) ?: -1
+                if (readResult > 0) return true
+            }
+            releaseMediaComponents()
+            delay(250) 
+        }
+        return false
+    }
+
     @SuppressLint("MissingPermission")
     private fun initializeHardware(): Boolean {
-        releaseMediaComponents()
         try {
             val configuredRate = config.samplingRate
             val supportedSampleRates = intArrayOf(SAMPLE_RATE_16K, SAMPLE_RATE_44K, SAMPLE_RATE_48K)
@@ -194,13 +222,16 @@ class VoiceRecorder(private val context: Context) {
                         sampleRate = rate
                         recordingBufferSize = maxOf(minBufferSize * 2, OPTIMAL_BUFFER_SIZE)
                         audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, channelConfig, audioFormat, recordingBufferSize)
+                        
                         if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
-                            validRateFound = true
-                            break
-                        } else {
-                            audioRecord?.release()
-                            audioRecord = null
+                            audioRecord?.startRecording()
+                            if (audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                                validRateFound = true
+                                break
+                            }
                         }
+                        audioRecord?.release()
+                        audioRecord = null
                     }
                 } catch (_: Exception) {}
             }
@@ -215,7 +246,6 @@ class VoiceRecorder(private val context: Context) {
             mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
             mediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             mediaCodec?.start()
-            audioRecord?.startRecording()
             
             return true
         } catch (e: Exception) {
@@ -228,7 +258,7 @@ class VoiceRecorder(private val context: Context) {
         val bufferInfo = MediaCodec.BufferInfo()
         val maxStorageBytes = config.maxStorageSizeBytes
         
-        var lastSoundTime = 0L 
+        var lastSoundTime = System.currentTimeMillis() 
         var silenceDurationMs = 0L
         val vadFrameSize = (sampleRate * 0.03).toInt() 
 
@@ -238,7 +268,12 @@ class VoiceRecorder(private val context: Context) {
                 if (isPaused) { delay(100); continue }
                 
                 val readSize = audioRecord?.read(buffer, 0, buffer.size) ?: -1
-                if (readSize <= 0) { delay(10); continue }
+                if (readSize <= 0) {
+                    if (readSize == AudioRecord.ERROR_INVALID_OPERATION || readSize == AudioRecord.ERROR_BAD_VALUE) {
+                        throw IllegalStateException("Hardware connection lost")
+                    }
+                    delay(10); continue 
+                }
 
                 var isVoiceDetected = false
                 var offset = 0
@@ -270,7 +305,6 @@ class VoiceRecorder(private val context: Context) {
                         }
                         isPreRollFlushed = true
                     }
-                    
                     processEncodingRobust(buffer, readSize)
                 } else {
                     silenceDurationMs += (readSize * 1000L) / sampleRate
@@ -283,6 +317,7 @@ class VoiceRecorder(private val context: Context) {
                         
                         if (config.silenceDetectionStrategy == 1 && silenceDurationMs > DEEP_SILENCE_THRESHOLD_MS) {
                             performAggressiveDutyCycleBackoff()
+                            silenceDurationMs = 0
                         } else {
                             delay((readSize * 1000L) / sampleRate)
                         }
@@ -293,7 +328,9 @@ class VoiceRecorder(private val context: Context) {
 
             } catch (e: Exception) {
                 Log.e(TAG, "Critical loop error", e)
-                delay(1000)
+                lastError = "Loop error: ${e.message}"
+                stateListener?.onError(lastError!!)
+                break
             }
         }
         
@@ -313,16 +350,36 @@ class VoiceRecorder(private val context: Context) {
         }
     }
 
+    /**
+     * Aggressive Power Saving: Powers down MIC during deep silence.
+     * Uses Stable withTimeoutOrNull to wait for wakeup signals.
+     */
     private suspend fun performAggressiveDutyCycleBackoff() {
         try {
-            audioRecord?.stop()
-            delay(currentDutyCycleDelayMs)
+            Log.d(TAG, "Deep silence: Powering down MIC (Backoff: ${currentDutyCycleDelayMs}ms)")
+            releaseMediaComponents()
+            
+            // STABLE REPLACEMENT: Wait for wakeup signal OR timeout
+            val receivedSignal = withTimeoutOrNull(currentDutyCycleDelayMs) {
+                wakeupSignal.receive()
+            }
+
+            if (receivedSignal != null) {
+                Log.i(TAG, "Backoff interrupted: Immediate wakeup")
+            } else {
+                Log.d(TAG, "Backoff timeout reached: Periodic check")
+            }
+
             currentDutyCycleDelayMs = min(currentDutyCycleDelayMs * 2, MAX_DUTY_CYCLE_DELAY_MS)
-            if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
-                audioRecord?.startRecording()
+            
+            if (_isRecording.get()) {
+                if (!initializeHardwareWithRetry()) {
+                    throw IllegalStateException("Background mic access lost")
+                }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Duty cycle error", e)
+            Log.e(TAG, "Backoff error", e)
+            throw e
         }
     }
 
@@ -333,39 +390,28 @@ class VoiceRecorder(private val context: Context) {
             if (inputIdx >= 0) {
                 val inputBuffer = mediaCodec?.getInputBuffer(inputIdx) ?: break
                 inputBuffer.clear()
-                
                 val maxShorts = inputBuffer.capacity() / 2
                 val shortsToPut = min(readSize - offset, maxShorts)
-                
                 inputBuffer.asShortBuffer().put(buffer, offset, shortsToPut)
                 val ptsUs = (totalSamplesProcessed * 1_000_000L) / sampleRate
                 mediaCodec?.queueInputBuffer(inputIdx, 0, shortsToPut * 2, ptsUs, 0)
-                
                 totalSamplesProcessed += shortsToPut
                 offset += shortsToPut
-            } else {
-                Log.w(TAG, "Encoder busy, skipping chunk at offset $offset")
-                break
-            }
+            } else break
         }
     }
 
     private fun drainOutput(info: MediaCodec.BufferInfo, isEos: Boolean = false) {
         if (isEos) {
             val inputIdx = mediaCodec?.dequeueInputBuffer(5000) ?: -1
-            if (inputIdx >= 0) {
-                mediaCodec?.queueInputBuffer(inputIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-            }
+            if (inputIdx >= 0) mediaCodec?.queueInputBuffer(inputIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
         }
-
         var outputIdx = mediaCodec?.dequeueOutputBuffer(info, 0) ?: -1
         while (outputIdx >= 0) {
             val encodedData = mediaCodec?.getOutputBuffer(outputIdx)
             if (encodedData != null && info.size > 0) {
                 val packetSize = info.size + 7
-                if (writeBuffer.remaining() < packetSize) {
-                    flushBuffer(forceSync = false)
-                }
+                if (writeBuffer.remaining() < packetSize) flushBuffer(forceSync = false)
                 fillADTSHeader(adtsHeaderBuffer, packetSize)
                 writeBuffer.put(adtsHeaderBuffer)
                 writeBuffer.put(encodedData)
@@ -382,9 +428,7 @@ class VoiceRecorder(private val context: Context) {
                 val written = fileChannel?.write(writeBuffer) ?: 0
                 _bytesWrittenToFile += written
                 writeBuffer.clear()
-                if (forceSync) {
-                    fileChannel?.force(false)
-                }
+                if (forceSync) fileChannel?.force(false)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Flush error", e)
@@ -460,7 +504,7 @@ class VoiceRecorder(private val context: Context) {
 
     fun stop(reason: String = "User Action") { 
         if (_isRecording.get()) {
-            _finalDuration = durationMillis // Capture before setting state to false
+            _finalDuration = durationMillis
             _isRecording.set(false) 
         }
     }
@@ -492,13 +536,14 @@ class VoiceRecorder(private val context: Context) {
         private const val TAG = "VoiceRecorder"
         private const val WAKELOCK_TAG = "TalkToTheHand:RecWakeLock"
         private const val WAKELOCK_TIMEOUT_MS = 10 * 60 * 60 * 1000L
+        private const val MIC_ACCESS_TIMEOUT_MS = 2000L 
         private const val SAMPLE_RATE_16K = 16000
         private const val SAMPLE_RATE_44K = 44100
         private const val SAMPLE_RATE_48K = 48000
         private const val OPTIMAL_BUFFER_SIZE = 16384 
         private const val PRE_ROLL_MS = 800L 
         private const val SILENCE_HOLD_MS = 1000L 
-        private const val DEEP_SILENCE_THRESHOLD_MS = 10000L 
+        private const val DEEP_SILENCE_THRESHOLD_MS = 15000L 
         private const val BASE_DUTY_CYCLE_DELAY_MS = 1000L 
         private const val MAX_DUTY_CYCLE_DELAY_MS = 30000L 
     }

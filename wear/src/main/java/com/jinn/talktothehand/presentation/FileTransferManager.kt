@@ -21,6 +21,10 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 
+/**
+ * Manages reliable file transfers from Watch to Mobile.
+ * Uses WorkManager with a short deferred start to balance system load and responsiveness.
+ */
 class FileTransferManager(private val context: Context) {
     
     private val config = RecorderConfig(context)
@@ -29,6 +33,9 @@ class FileTransferManager(private val context: Context) {
         schedulePeriodicSync()
     }
 
+    /**
+     * Enqueues a file for transfer with a short initial delay to prioritize recording stability.
+     */
     fun transferFile(file: File) {
         if (!file.exists()) return
 
@@ -44,6 +51,10 @@ class FileTransferManager(private val context: Context) {
                     .setRequiredNetworkType(NetworkType.CONNECTED)
                     .build()
             )
+            // DEFERRED TRANSFER: Wait 5 seconds before starting transmission.
+            // This is long enough for hardware initialization to settle, 
+            // but short enough for a snappy user experience.
+            .setInitialDelay(TRANSFER_INITIAL_DELAY_SEC, TimeUnit.SECONDS)
             .setBackoffCriteria(
                 androidx.work.BackoffPolicy.EXPONENTIAL,
                 FileTransferWorker.BACKOFF_DELAY_MS,
@@ -67,7 +78,6 @@ class FileTransferManager(private val context: Context) {
         
         files?.forEach { file ->
             if (file.name.contains("_temp")) {
-                // If a temp file hasn't been modified in a minute, assume it's from a crash.
                 if (System.currentTimeMillis() - file.lastModified() > ABANDONED_FILE_THRESHOLD_MS) {
                      Log.d(TAG, "Found abandoned temp file, recovering: ${file.name}")
                      val recoveredName = file.name.replace("_temp", "_recovered")
@@ -75,7 +85,7 @@ class FileTransferManager(private val context: Context) {
                      if (file.renameTo(recoveredFile)) {
                          transferFile(recoveredFile)
                      } else {
-                         transferFile(file) // Retry with original name if rename fails
+                         transferFile(file)
                      }
                 }
             } else {
@@ -86,7 +96,6 @@ class FileTransferManager(private val context: Context) {
     }
     
     private fun schedulePeriodicSync() {
-        // Using 15 minutes directly to avoid a potential build issue with the MIN_PERIODIC_INTERVAL_MILLIS constant.
         val syncWork = PeriodicWorkRequestBuilder<PendingFilesCheckWorker>(
             15, 
             TimeUnit.MINUTES
@@ -102,6 +111,7 @@ class FileTransferManager(private val context: Context) {
     companion object {
         private const val TAG = "FileTransferManager"
         private const val ABANDONED_FILE_THRESHOLD_MS = 60000L
+        private const val TRANSFER_INITIAL_DELAY_SEC = 5L // Optimized for v1.2.0
     }
 }
 
@@ -188,7 +198,7 @@ class FileTransferWorker(
 class PendingFilesCheckWorker(
     context: Context, 
     workerParams: WorkerParameters
-) : Worker(context, workerParams) { // Changed to simple Worker
+) : Worker(context, workerParams) {
 
     override fun doWork(): Result {
         FileTransferManager(applicationContext).checkAndRetryPendingTransfers()

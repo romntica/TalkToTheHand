@@ -25,8 +25,7 @@ import kotlinx.coroutines.withContext
 import java.util.concurrent.TimeUnit
 
 /**
- * Wear OS Recorder ViewModel.
- * Refreshes UI at a stable 1-second interval to balance responsiveness and system load.
+ * Wear OS Recorder ViewModel with Foreground Wakeup trigger.
  */
 class RecorderViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -34,6 +33,15 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     private var activeRecorder: VoiceRecorder? = null
     private val config = RecorderConfig(application)
     
+    // Cache the Vibrator instance at initialization
+    private val vibrator: Vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        val vibratorManager = application.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+        vibratorManager.defaultVibrator
+    } else {
+        @Suppress("DEPRECATION")
+        application.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+    }
+
     // --- UI States ---
     var isRecording by mutableStateOf(false)
         private set
@@ -85,9 +93,10 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     }
 
     /**
-     * Actively refreshes the state. Called on app resume.
+     * Actively refreshes the state and forces a wakeup if in backoff.
      */
     fun refreshState() {
+        activeRecorder?.forceWakeup()
         syncStateWithService()
     }
 
@@ -114,7 +123,6 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         
         viewModelScope.launch {
             try {
-                // Buffer for hardware stabilization
                 delay(500)
                 withContext(Dispatchers.IO) {
                     val context = getApplication<Application>()
@@ -190,7 +198,6 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             while (isActive) {
                 val recorder = activeRecorder
                 
-                // Refresh logic once per second
                 if (recorder != null && recorder.isRecording) {
                     isRecording = true
                     isPaused = recorder.isPaused
@@ -218,13 +225,9 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     fun dismissError() { errorMessage = null }
     
     private fun vibrate(effect: VibrationEffect) {
-        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            (getApplication<Application>().getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
-        } else {
-            @Suppress("DEPRECATION")
-            getApplication<Application>().getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        if (vibrator.hasVibrator()) {
+            vibrator.vibrate(effect)
         }
-        if (vibrator.hasVibrator()) vibrator.vibrate(effect)
     }
     
     fun getFormattedTime(): String {

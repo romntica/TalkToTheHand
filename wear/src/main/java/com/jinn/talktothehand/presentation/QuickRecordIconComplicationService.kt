@@ -9,8 +9,8 @@ import androidx.wear.watchface.complications.datasource.ComplicationDataSourceSe
 import com.jinn.talktothehand.R
 
 /**
- * Small Image-based complication that toggles recording in the background via Transparent Activity.
- * Uses specific vector icons for Record and Stop states as requested.
+ * Small Image-based complication that toggles recording.
+ * Rolled back to stable SMALL_IMAGE type with vector icons.
  */
 class QuickRecordIconComplicationService : ComplicationDataSourceService() {
 
@@ -26,9 +26,9 @@ class QuickRecordIconComplicationService : ComplicationDataSourceService() {
         val config = RecorderConfig(this)
         val isRecording = config.isRecording
 
-        // Reverting to Transparent Activity for reliable foreground state on Android 14+
         val intent = Intent(this, TransparentServiceLauncherActivity::class.java).apply {
             action = VoiceRecorderService.ACTION_TOGGLE_RECORDING
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         }
 
         val pendingIntent = PendingIntent.getActivity(
@@ -38,24 +38,23 @@ class QuickRecordIconComplicationService : ComplicationDataSourceService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        // Reverting to specified resource icons
         val iconRes = if (isRecording) {
             R.drawable.ic_complication_stop
         } else {
             R.drawable.ic_complication_record
         }
 
+        val contentDesc = if (isRecording) "Stop Recording" else "Start Recording"
+
         val data = SmallImageComplicationData.Builder(
             smallImage = SmallImage.Builder(
                 Icon.createWithResource(this, iconRes),
                 SmallImageType.ICON
             ).build(),
-            contentDescription = PlainComplicationText.Builder(
-                if (isRecording) "Stop Recording" else "Start Recording"
-            ).build()
+            contentDescription = PlainComplicationText.Builder(contentDesc).build()
         )
-            .setTapAction(pendingIntent)
-            .build()
+        .setTapAction(pendingIntent)
+        .build()
 
         listener.onComplicationData(data)
     }
@@ -67,7 +66,7 @@ class QuickRecordIconComplicationService : ComplicationDataSourceService() {
                 Icon.createWithResource(this, R.drawable.ic_complication_record),
                 SmallImageType.ICON
             ).build(),
-            contentDescription = PlainComplicationText.Builder("Toggle Recording Preview").build()
+            contentDescription = PlainComplicationText.Builder("Toggle Preview").build()
         ).build()
     }
 }

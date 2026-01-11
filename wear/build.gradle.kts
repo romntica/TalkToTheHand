@@ -12,8 +12,8 @@ android {
         applicationId = "com.jinn.talktothehand"
         minSdk = 30
         targetSdk = 35
-        versionCode = 5
-        versionName = "1.2.0"
+        versionCode = 6
+        versionName = "1.2.1"
 
     }
 
@@ -61,6 +61,9 @@ dependencies {
     implementation(libs.androidx.core.splashscreen)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.compose.material.icons.extended)
+    
+    // Required to fix InvalidFragmentVersionForActivityResult lint error
+    implementation("androidx.fragment:fragment-ktx:1.8.5")
     
     implementation("androidx.wear.watchface:watchface-complications-data-source:1.2.1")
     implementation("androidx.wear.watchface:watchface-complications-data:1.2.1")
