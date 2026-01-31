@@ -28,6 +28,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -43,6 +44,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.wear.compose.material.Button
+import androidx.wear.compose.material.ButtonDefaults
 import androidx.wear.compose.material.Icon
 import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
@@ -75,7 +77,10 @@ class MainActivity : ComponentActivity() {
             WearApp(
                 intent = intent,
                 checkPermission = { checkPermission() },
-                requestPermission = { requestPermission() }
+                requestPermission = { requestPermission() },
+                onNavigateToSettings = {
+                    startActivity(Intent(this, SettingsActivity::class.java))
+                }
             )
         }
     }
@@ -106,7 +111,8 @@ fun WearApp(
     intent: Intent?,
     viewModel: RecorderViewModel = viewModel(),
     checkPermission: () -> Boolean,
-    requestPermission: () -> Unit
+    requestPermission: () -> Unit,
+    onNavigateToSettings: () -> Unit
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     
@@ -169,7 +175,8 @@ fun WearApp(
                         isBusy = viewModel.isBusy,
                         onStartClick = {
                             if (checkPermission()) viewModel.startRecording() else requestPermission()
-                        }
+                        },
+                        onSettingsClick = onNavigateToSettings
                     )
                 } else {
                     RecordingScreen(
@@ -193,7 +200,7 @@ fun WearApp(
 }
 
 @Composable
-fun StartRecordingScreen(isBusy: Boolean, onStartClick: () -> Unit) {
+fun StartRecordingScreen(isBusy: Boolean, onStartClick: () -> Unit, onSettingsClick: () -> Unit) {
     Button(
         onClick = onStartClick,
         enabled = !isBusy,
@@ -205,8 +212,22 @@ fun StartRecordingScreen(isBusy: Boolean, onStartClick: () -> Unit) {
             modifier = Modifier.size(32.dp)
         )
     }
-    Spacer(modifier = Modifier.height(8.dp))
+    Spacer(modifier = Modifier.height(4.dp))
     Text(text = "Quick Record", style = MaterialTheme.typography.caption1)
+    
+    Spacer(modifier = Modifier.height(12.dp))
+    
+    Button(
+        onClick = onSettingsClick,
+        modifier = Modifier.size(ButtonDefaults.SmallButtonSize),
+        colors = ButtonDefaults.secondaryButtonColors()
+    ) {
+        Icon(
+            imageVector = Icons.Default.Settings,
+            contentDescription = "Settings",
+            modifier = Modifier.size(18.dp)
+        )
+    }
 }
 
 @Composable

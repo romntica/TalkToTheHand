@@ -3,7 +3,6 @@ package com.jinn.talktothehand
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Intent
-import android.database.Cursor
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -27,6 +26,7 @@ class VoiceRecordingListenerService : WearableListenerService() {
     private val executor = Executors.newSingleThreadExecutor()
     
     companion object {
+        const val TAG = "VoiceListener"
         const val ACTION_TRANSFER_STATUS = "com.jinn.talktothehand.TRANSFER_STATUS"
         const val EXTRA_STATUS = "status"
         const val EXTRA_FILENAME = "filename"
@@ -35,31 +35,24 @@ class VoiceRecordingListenerService : WearableListenerService() {
         const val STATUS_COMPLETED = "COMPLETED"
         const val STATUS_FAILED = "FAILED"
         
-        // Action for broadcasting received config from watch
         const val ACTION_CONFIG_RECEIVED = "com.jinn.talktothehand.CONFIG_RECEIVED"
         const val EXTRA_CONFIG_DATA = "config_data"
+
+        // Path constants
+        const val PATH_VOICE_RECORDING = "/voice_recording"
+        const val PATH_TELEMETRY_LOG = "/telemetry/log"
     }
 
     override fun onMessageReceived(messageEvent: MessageEvent) {
         super.onMessageReceived(messageEvent)
-        
         when (messageEvent.path) {
             "/telemetry/error" -> {
                 val logMessage = String(messageEvent.data, StandardCharsets.UTF_8)
-                Log.e("VoiceListener", "Received remote error: $logMessage")
-                
-                // Save to file
-                executor.execute {
-                    saveLogToFile(logMessage)
-                }
+                executor.execute { saveLogToFile(logMessage) }
             }
-            
             "/config/current_v2" -> {
-                 Log.d("VoiceListener", "Received current config from watch")
-                 val configData = messageEvent.data
-                 // Broadcast this data to the app UI (e.g., Settings screen)
                  val intent = Intent(ACTION_CONFIG_RECEIVED).apply {
-                     putExtra(EXTRA_CONFIG_DATA, configData)
+                     putExtra(EXTRA_CONFIG_DATA, messageEvent.data)
                      setPackage(packageName)
                  }
                  sendBroadcast(intent)
@@ -70,105 +63,86 @@ class VoiceRecordingListenerService : WearableListenerService() {
     override fun onChannelOpened(channel: ChannelClient.Channel) {
         super.onChannelOpened(channel)
         
-        if (channel.path.startsWith("/voice_recording")) {
-            Log.d("VoiceListener", "Channel opened: ${channel.path}")
-            
-            // Extract filename from path for notification
-            val rawFileName = if (channel.path.contains("/")) {
-                channel.path.substringAfterLast("/")
-            } else {
-                "Unknown"
-            }
-            
-            // Notify UI: Transfer Started
-            sendTransferStatus(STATUS_STARTED, rawFileName)
-            
-            val channelClient = Wearable.getChannelClient(this)
-            val senderNodeId = channel.nodeId
-            
-            // Do I/O in background
-            executor.execute {
-                try {
-                    // Get InputStream
-                    val inputStream = Tasks.await(channelClient.getInputStream(channel), 10000, java.util.concurrent.TimeUnit.MILLISECONDS)
-                    
-                    val fileName = if (rawFileName != "Unknown") {
-                        rawFileName
-                    } else {
-                        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-                        // Changed extension to .aac for ADTS stream
-                        "Recording_${timestamp}.aac"
-                    }
-                    
-                    // Use MediaStore for Android 10+ (Scoped Storage) compatibility.
-                    val resolver = contentResolver
-                    val contentValues = ContentValues().apply {
-                        put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                        put(MediaStore.MediaColumns.MIME_TYPE, "audio/aac") // Updated MIME type for AAC
-                        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/TalkToTheHand")
-                        put(MediaStore.MediaColumns.IS_PENDING, 1)
-                    }
+        val isAudio = channel.path.startsWith(PATH_VOICE_RECORDING)
+        val isLog = channel.path.startsWith(PATH_TELEMETRY_LOG)
 
-                    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
-                    var transferSuccess = false
-                    
-                    if (uri != null) {
-                        Log.d("VoiceListener", "Saving to MediaStore: $uri")
-                        
-                        try {
-                            inputStream.use { input ->
-                                resolver.openOutputStream(uri).use { output ->
-                                    if (output != null) {
-                                        input.copyTo(output)
-                                        Log.d("VoiceListener", "File saved successfully")
-                                        transferSuccess = true
-                                    } else {
-                                        Log.e("VoiceListener", "Failed to open output stream")
-                                    }
+        if (!isAudio && !isLog) return
+
+        Log.d(TAG, "Channel opened: ${channel.path}")
+
+        val rawFileName = channel.path.substringAfterLast("/", "Unknown")
+        sendTransferStatus(STATUS_STARTED, rawFileName)
+
+        val channelClient = Wearable.getChannelClient(this)
+        val senderNodeId = channel.nodeId
+
+        executor.execute {
+            try {
+                val inputStream = Tasks.await(channelClient.getInputStream(channel), 10000, java.util.concurrent.TimeUnit.MILLISECONDS)
+
+                // Determine destination based on path
+                val relativePath = if (isLog) {
+                    Environment.DIRECTORY_DOWNLOADS + "/TalkToTheHand/Logs"
+                } else {
+                    Environment.DIRECTORY_DOWNLOADS + "/TalkToTheHand"
+                }
+
+                val mimeType = if (isLog) "text/plain" else "audio/aac"
+
+                val resolver = contentResolver
+                val contentValues = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, rawFileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+
+                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
+                var success = false
+
+                if (uri != null) {
+                    try {
+                        inputStream.use { input ->
+                            resolver.openOutputStream(uri).use { output ->
+                                if (output != null) {
+                                    input.copyTo(output)
+                                    success = true
                                 }
                             }
-                        } catch (e: Exception) {
-                            Log.e("VoiceListener", "Stream copy failed", e)
-                            // Clean up pending entry if failed
-                            resolver.delete(uri, null, null)
                         }
-                        
-                        if (transferSuccess) {
-                            // Mark as not pending
-                            contentValues.clear()
-                            contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                            resolver.update(uri, contentValues, null, null)
-                            
-                            // Send ACK back to watch
-                            sendAck(senderNodeId, fileName)
-                            
-                            // Notify UI: Success
-                            sendTransferStatus(STATUS_COMPLETED, fileName)
-                        } else {
-                             sendTransferStatus(STATUS_FAILED, fileName)
-                        }
-                        
-                    } else {
-                        Log.e("VoiceListener", "Failed to create MediaStore entry")
-                        sendTransferStatus(STATUS_FAILED, fileName)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Stream copy failed", e)
+                        resolver.delete(uri, null, null)
                     }
-                    
-                    channelClient.close(channel)
-                    
-                } catch (e: Exception) {
-                    Log.e("VoiceListener", "Error saving file", e)
+
+                    if (success) {
+                        contentValues.clear()
+                        contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                        resolver.update(uri, contentValues, null, null)
+
+                        // Send ACK back to watch to trigger local deletion
+                        sendAck(senderNodeId, rawFileName)
+                        sendTransferStatus(STATUS_COMPLETED, rawFileName)
+                        Log.d(TAG, "File saved to $relativePath: $rawFileName")
+                    } else {
+                        sendTransferStatus(STATUS_FAILED, rawFileName)
+                    }
+                } else {
                     sendTransferStatus(STATUS_FAILED, rawFileName)
                 }
+                channelClient.close(channel)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error processing channel data", e)
+                sendTransferStatus(STATUS_FAILED, rawFileName)
             }
         }
     }
     
     private fun saveLogToFile(message: String) {
-        val logLine = "$message\n\n"
-        // Create a filename based on the current date for daily log rotation
         val dateStamp = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
         val logFilename = "WearLog_$dateStamp.txt"
-        
+        val logLine = "$message\n\n"
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             saveLogToMediaStore(logFilename, logLine)
         } else {
@@ -180,16 +154,13 @@ class VoiceRecordingListenerService : WearableListenerService() {
     private fun saveLogToMediaStore(filename: String, logLine: String) {
         val resolver = contentResolver
         val relativePath = Environment.DIRECTORY_DOWNLOADS + "/TalkToTheHand/Logs/"
-        
-        // Use MediaStore to find an existing file or create a new one.
         val queryUri = MediaStore.Downloads.EXTERNAL_CONTENT_URI
-        val projection = arrayOf(MediaStore.Downloads._ID)
         val selection = "${MediaStore.Downloads.DISPLAY_NAME} = ? AND ${MediaStore.Downloads.RELATIVE_PATH} = ?"
         val selectionArgs = arrayOf(filename, relativePath)
         
         var existingUri: Uri? = null
         try {
-            resolver.query(queryUri, projection, selection, selectionArgs, null)?.use { cursor ->
+            resolver.query(queryUri, arrayOf(MediaStore.Downloads._ID), selection, selectionArgs, null)?.use { cursor ->
                 if (cursor.moveToFirst()) {
                     val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Downloads._ID))
                     existingUri = ContentUris.withAppendedId(queryUri, id)
@@ -197,7 +168,6 @@ class VoiceRecordingListenerService : WearableListenerService() {
             }
 
             val uri = existingUri ?: run {
-                // File does not exist, create it.
                 val contentValues = ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
                     put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
@@ -207,16 +177,10 @@ class VoiceRecordingListenerService : WearableListenerService() {
             }
 
             if (uri != null) {
-                // Use "wa" mode (write-append) to append to the file.
-                resolver.openOutputStream(uri, "wa")?.use { outputStream ->
-                    outputStream.write(logLine.toByteArray(StandardCharsets.UTF_8))
-                }
-                Log.d("VoiceListener", "Telemetry appended to: $uri")
-            } else {
-                 Log.e("VoiceListener", "Failed to create or find log file URI")
+                resolver.openOutputStream(uri, "wa")?.use { it.write(logLine.toByteArray(StandardCharsets.UTF_8)) }
             }
         } catch (e: Exception) {
-            Log.e("VoiceListener", "Failed to save telemetry to MediaStore", e)
+            Log.e(TAG, "Failed to save telemetry to MediaStore", e)
         }
     }
 
@@ -224,36 +188,24 @@ class VoiceRecordingListenerService : WearableListenerService() {
         try {
             val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
             val logDir = File(downloadsDir, "TalkToTheHand/Logs")
-            if (!logDir.exists()) {
-                logDir.mkdirs()
-            }
-            val logFile = File(logDir, filename)
-            // Use FileOutputStream with append = true
-            FileOutputStream(logFile, true).use { fos ->
-                fos.write(logLine.toByteArray(StandardCharsets.UTF_8))
-            }
-            Log.d("VoiceListener", "Telemetry saved to ${logFile.absolutePath}")
+            if (!logDir.exists()) logDir.mkdirs()
+            FileOutputStream(File(logDir, filename), true).use { it.write(logLine.toByteArray(StandardCharsets.UTF_8)) }
         } catch (e: Exception) {
-            Log.e("VoiceListener", "Failed to save telemetry to legacy storage", e)
+            Log.e(TAG, "Failed to save telemetry to legacy storage", e)
         }
     }
     
     private fun sendAck(nodeId: String, fileName: String) {
         Wearable.getMessageClient(this)
             .sendMessage(nodeId, "/voice_recording_ack", fileName.toByteArray())
-            .addOnSuccessListener { 
-                Log.d("VoiceListener", "ACK sent for $fileName")
-            }
-            .addOnFailureListener { e ->
-                Log.e("VoiceListener", "Failed to send ACK", e)
-            }
     }
     
     private fun sendTransferStatus(status: String, fileName: String) {
-        val intent = Intent(ACTION_TRANSFER_STATUS)
-        intent.putExtra(EXTRA_STATUS, status)
-        intent.putExtra(EXTRA_FILENAME, fileName)
-        intent.setPackage(packageName) // Security: Only send to my own app
+        val intent = Intent(ACTION_TRANSFER_STATUS).apply {
+            putExtra(EXTRA_STATUS, status)
+            putExtra(EXTRA_FILENAME, fileName)
+            setPackage(packageName)
+        }
         sendBroadcast(intent)
     }
 }

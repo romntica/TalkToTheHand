@@ -11,7 +11,7 @@ class RecorderConfig(context: Context) {
         set(value) = prefs.edit { putInt("max_chunk_mb", value) }
 
     var maxStorageSizeMb: Int
-        get() = prefs.getInt("max_storage_mb", 2048)
+        get() = prefs.getInt("max_storage_mb", 500) // Default to 500MB based on new requirements
         set(value) = prefs.edit { putInt("max_storage_mb", value) }
     
     var bitrate: Int
@@ -30,13 +30,24 @@ class RecorderConfig(context: Context) {
         get() = prefs.getBoolean("telemetry_enabled", false)
         set(value) = prefs.edit { putBoolean("telemetry_enabled", value) }
         
+    /**
+     * VAD Sensitivity (Silence Threshold). 
+     * Range: 500 - 2000
+     */
     var silenceThreshold: Int
         get() = prefs.getInt("silence_threshold", 1000)
         set(value) = prefs.edit { putInt("silence_threshold", value) }
         
+    /**
+     * 0: Normal VAD, 1: Aggressive VAD
+     */
     var silenceDetectionStrategy: Int
         get() = prefs.getInt("silence_strategy", 0)
         set(value) = prefs.edit { putInt("silence_strategy", value) }
+
+    var isAggressiveVadEnabled: Boolean
+        get() = silenceDetectionStrategy == 1
+        set(value) { silenceDetectionStrategy = if (value) 1 else 0 }
 
     /**
      * Total number of chunks recorded in the current session.

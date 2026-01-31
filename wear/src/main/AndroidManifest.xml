@@ -33,6 +33,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".presentation.SettingsActivity"
+            android:exported="false"
+            android:label="Settings" />
+
         <!-- Truly Transparent Bridge Activity -->
         <activity
             android:name=".presentation.TransparentServiceLauncherActivity"

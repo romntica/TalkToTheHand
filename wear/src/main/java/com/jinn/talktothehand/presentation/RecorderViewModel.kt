@@ -1,8 +1,10 @@
 package com.jinn.talktothehand.presentation
 
 import android.app.Application
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -13,6 +15,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -25,7 +28,7 @@ import kotlinx.coroutines.withContext
 import java.util.concurrent.TimeUnit
 
 /**
- * Wear OS Recorder ViewModel with Foreground Wakeup trigger.
+ * Wear OS Recorder ViewModel with explicit service event synchronization.
  */
 class RecorderViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -33,7 +36,6 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     private var activeRecorder: VoiceRecorder? = null
     private val config = RecorderConfig(application)
     
-    // Cache the Vibrator instance at initialization
     private val vibrator: Vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         val vibratorManager = application.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
         vibratorManager.defaultVibrator
@@ -60,9 +62,36 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
     private var uiUpdateJob: Job? = null
 
+    // Explicit Status Receiver for Service Events
+    private val statusReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == VoiceRecorderService.ACTION_STATUS_CHANGED) {
+                val serviceIsRecording = intent.getBooleanExtra(VoiceRecorderService.EXTRA_IS_RECORDING, false)
+                val error = intent.getStringExtra(VoiceRecorderService.EXTRA_ERROR)
+
+                viewModelScope.launch(Dispatchers.Main) {
+                    isRecording = serviceIsRecording
+                    if (error != null) {
+                        errorMessage = error
+                        vibrate(VIBRATION_ERROR)
+                    }
+                    if (isRecording) startUiUpdates() else stopUiUpdates()
+                }
+            }
+        }
+    }
+
     init {
         serviceConnection.bind()
         
+        // Register Status Broadcast Receiver
+        val filter = IntentFilter(VoiceRecorderService.ACTION_STATUS_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            application.registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            application.registerReceiver(statusReceiver, filter)
+        }
+
         viewModelScope.launch {
             serviceConnection.recorderFlow.collectLatest { recorder ->
                 activeRecorder = recorder
@@ -87,14 +116,12 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                 viewModelScope.launch(Dispatchers.Main) {
                     errorMessage = message
                     vibrate(VIBRATION_ERROR)
+                    syncStateWithService()
                 }
             }
         }
     }
 
-    /**
-     * Actively refreshes the state and forces a wakeup if in backoff.
-     */
     fun refreshState() {
         activeRecorder?.forceWakeup()
         syncStateWithService()
@@ -104,13 +131,12 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         val recorder = activeRecorder
         val isServiceActive = (recorder != null && recorder.isRecording) || config.isRecording
         
+        isRecording = isServiceActive
         if (isServiceActive) {
-            isRecording = true
             isPaused = recorder?.isPaused ?: false
             sessionChunkCount = config.sessionChunkCount
             startUiUpdates()
-        } else if (isRecording) {
-            isRecording = false
+        } else {
             stopUiUpdates()
             resetUIState()
         }
@@ -120,10 +146,12 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         if (isBusy || isRecording) return
         isBusy = true
         errorMessage = null 
-        
+
+        // Optimistic UI state - will be corrected by Broadcast if service fails
+        isRecording = true
+
         viewModelScope.launch {
             try {
-                delay(500)
                 withContext(Dispatchers.IO) {
                     val context = getApplication<Application>()
                     val intent = Intent(context, VoiceRecorderService::class.java).apply {
@@ -132,12 +160,11 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     context.startForegroundService(intent)
                 }
                 vibrate(VIBRATION_SHORT)
-                syncStateWithService()
             } catch (e: Exception) {
-                errorMessage = "Start failed: ${e.message}"
+                isRecording = false
+                errorMessage = "Launch failed: ${e.message}"
                 vibrate(VIBRATION_ERROR)
             } finally {
-                delay(500)
                 isBusy = false
             }
         }
@@ -157,11 +184,9 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     context.startService(intent)
                 }
                 vibrate(VIBRATION_DOUBLE)
-                syncStateWithService()
             } catch (e: Exception) {
                 errorMessage = "Stop error: ${e.message}"
             } finally {
-                delay(500)
                 isBusy = false
             }
         }
@@ -182,7 +207,6 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun resetUIState() {
-        isRecording = false
         isPaused = false
         elapsedTimeMillis = 0
         fileSizeString = "0 MB"
@@ -210,6 +234,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     sessionChunkCount = config.sessionChunkCount
                 } else {
                     isRecording = false
+                    resetUIState()
                     break
                 }
                 delay(1000) 
@@ -239,6 +264,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
     override fun onCleared() {
         super.onCleared()
+        getApplication<Application>().unregisterReceiver(statusReceiver)
         serviceConnection.unbind()
     }
     

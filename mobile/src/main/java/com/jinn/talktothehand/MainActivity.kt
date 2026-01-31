@@ -214,7 +214,10 @@ class MainActivity : AppCompatActivity() {
         val sampleRateSpinner = dialogView.findViewById<Spinner>(R.id.sample_rate_spinner)
         val autoStartCheckbox = dialogView.findViewById<CheckBox>(R.id.auto_start_checkbox)
         val telemetryCheckbox = dialogView.findViewById<CheckBox>(R.id.telemetry_checkbox)
-        val silenceThresholdInput = dialogView.findViewById<EditText>(R.id.silence_threshold_input)
+
+        // VAD Sensitivity (Slider)
+        val silenceThresholdSeekbar = dialogView.findViewById<SeekBar>(R.id.silence_threshold_seekbar)
+        val silenceThresholdValueText = dialogView.findViewById<TextView>(R.id.silence_threshold_value_text)
         val silenceStrategySpinner = dialogView.findViewById<Spinner>(R.id.silence_strategy_spinner)
 
         // --- Setup Chunk Size SeekBar ---
@@ -227,12 +230,25 @@ class MainActivity : AppCompatActivity() {
             override fun onStartTrackingTouch(seekBar: SeekBar?) {}
             override fun onStopTrackingTouch(seekBar: SeekBar?) {}
         })
+
+        // --- Setup VAD Sensitivity Slider ---
+        // Range: 500 - 2000, Step: 100. (2000-500)/100 = 15 steps.
+        silenceThresholdValueText.text = silenceThreshold.toString()
+        val thresholdProgress = ((silenceThreshold - 500) / 100).coerceIn(0, 15)
+        silenceThresholdSeekbar.progress = thresholdProgress
+        silenceThresholdSeekbar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                val value = (progress * 100) + 500
+                silenceThresholdValueText.text = value.toString()
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
         
         storageInput.setText(storageMb.toString())
         autoStartCheckbox.isChecked = autoStart
         telemetryCheckbox.isChecked = telemetry
-        silenceThresholdInput.setText(silenceThreshold.toString())
-        
+
         val bitrates = arrayOf(16000, 32000, 64000, 128000)
         val bitrateLabels = arrayOf("16 KBps", "32 KBps", "64 KBps", "128 KBps")
         val bitrateAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, bitrateLabels)
@@ -269,7 +285,7 @@ class MainActivity : AppCompatActivity() {
                 val selectedSampleRate = sampleRates[sampleRateSpinner.selectedItemPosition]
                 val selectedAutoStart = autoStartCheckbox.isChecked
                 val selectedTelemetry = telemetryCheckbox.isChecked
-                val newSilenceThreshold = silenceThresholdInput.text.toString().toIntOrNull() ?: 1000
+                val newSilenceThreshold = (silenceThresholdSeekbar.progress * 100) + 500
                 val selectedSilenceStrategy = silenceStrategies[silenceStrategySpinner.selectedItemPosition]
                 
                 sendConfigToWatch(newChunkMb, newStorageMb, selectedBitrate, selectedSampleRate, selectedAutoStart, selectedTelemetry, newSilenceThreshold, selectedSilenceStrategy)

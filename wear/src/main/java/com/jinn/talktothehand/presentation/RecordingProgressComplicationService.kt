@@ -47,6 +47,8 @@ class RecordingProgressComplicationService : ComplicationDataSourceService() {
         )
 
         val contentDesc = if (isRecording) "Recording Chunk #$chunkCount" else "Standby - Tap to Record"
+        val chunkText = if (isRecording) chunkCount.toString() else "--"
+        val iconResId = if (isRecording) R.drawable.ic_complication_record else R.drawable.ic_complication_stop
 
         val data = when (request.complicationType) {
             ComplicationType.RANGED_VALUE -> {
@@ -58,10 +60,10 @@ class RecordingProgressComplicationService : ComplicationDataSourceService() {
                 )
                 .setMonochromaticImage(
                     MonochromaticImage.Builder(
-                        Icon.createWithBitmap(drawStatusIcon(isRecording))
+                        Icon.createWithResource(this, iconResId)
                     ).build()
                 )
-                .setText(PlainComplicationText.Builder(chunkCount.toString()).build())
+                .setText(PlainComplicationText.Builder(chunkText).build())
                 .setTapAction(pendingIntent)
                 .build()
             }

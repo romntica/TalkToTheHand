@@ -72,27 +72,38 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content" />
             
-        <!-- ADDED: Silence Threshold -->
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="Silence Threshold (Amplitude)"
-            android:labelFor="@id/silence_threshold_input"/>
-
-        <EditText
-            android:id="@+id/silence_threshold_input"
+        <!-- VAD Sensitivity (Slider) -->
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:inputType="number"
-            android:autofillHints="false" />
-            
-        <!-- ADDED: Silence Strategy -->
+            android:layout_marginTop="16dp"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="VAD Sensitivity" />
+
+            <TextView
+                android:id="@+id/silence_threshold_value_text"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="1000" />
+        </LinearLayout>
+
+        <SeekBar
+            android:id="@+id/silence_threshold_seekbar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="15" />
+
+        <!-- Silence Strategy -->
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="Silence Power Saving"
+            android:text="Aggressive VAD"
             android:labelFor="@id/silence_strategy_spinner"/>
 
         <Spinner

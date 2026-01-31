@@ -14,39 +14,59 @@ import java.util.Locale
 
 /**
  * Diagnostic logger that sends structured logs to the phone companion.
+ * Standardizes log format as per AGENTS.md requirements.
  */
 class RemoteLogger(private val context: Context) {
 
     private val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
     private val batteryStatus: Intent? by lazy {
-        context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        try {
+            context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    init {
+        // Automatically setup crash handler if not already set
+        setupCrashHandler()
+    }
+
+    /**
+     * Set up a global exception handler to capture and log app crashes.
+     */
+    private fun setupCrashHandler() {
+        val currentHandler = Thread.getDefaultUncaughtExceptionHandler()
+        if (currentHandler is GlobalCrashHandler) return
+
+        Thread.setDefaultUncaughtExceptionHandler(GlobalCrashHandler(context, currentHandler))
     }
 
     fun info(tag: String, message: String) = log("INFO", tag, message)
     fun warn(tag: String, message: String) = log("WARN", tag, message)
     fun error(tag: String, message: String, throwable: Throwable? = null) {
-        val stackTrace = throwable?.let { "\n" + Log.getStackTraceString(it) } ?: ""
-        log("ERROR", tag, "$message$stackTrace")
+        log("ERROR", tag, message, throwable)
     }
 
-    private fun log(level: String, tag: String, message: String) {
+    private fun log(level: String, tag: String, message: String, throwable: Throwable? = null) {
         val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
         val systemInfo = getSystemMetadata()
+        val stacktrace = throwable?.let { "\n[Stacktrace]\n${Log.getStackTraceString(it)}" } ?: ""
+
+        // Structured Payload as per AGENTS.md
+        val payload = "[$timestamp] [$level] [$tag] $message\n[SystemInfo] $systemInfo$stacktrace"
         
-        val payload = "[$timestamp] [$level] [$tag] $message\n[SystemInfo] $systemInfo"
-        
-        // Log to local Logcat for development
+        // Log to local Logcat
         when (level) {
             "INFO" -> Log.i(tag, message)
             "WARN" -> Log.w(tag, message)
-            "ERROR" -> Log.e(tag, message)
+            "ERROR" -> Log.e(tag, "$message$stacktrace")
         }
 
         saveToTelemetryFile(payload)
     }
 
     private fun getSystemMetadata(): String {
-        // Named parameter 'intent' to avoid unresolved 'it' issues
         val batteryPct = batteryStatus?.let { intent ->
             val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
             val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
@@ -68,6 +88,32 @@ class RemoteLogger(private val context: Context) {
             logFile.appendText("$payload\n---\n")
         } catch (e: Exception) {
             Log.e("RemoteLogger", "Failed to save telemetry", e)
+        }
+    }
+
+    /**
+     * Inner class to handle uncaught exceptions across all threads.
+     */
+    private class GlobalCrashHandler(
+        private val context: Context,
+        private val defaultHandler: Thread.UncaughtExceptionHandler?
+    ) : Thread.UncaughtExceptionHandler {
+
+        override fun uncaughtException(thread: Thread, throwable: Throwable) {
+            try {
+                val logger = RemoteLogger(context)
+                logger.log(
+                    level = "ERROR",
+                    tag = "UncaughtException",
+                    message = "FATAL EXCEPTION: ${thread.name}",
+                    throwable = throwable
+                )
+            } catch (e: Exception) {
+                Log.e("CrashHandler", "Error logging crash", e)
+            } finally {
+                // Pass control back to system (shows "App has stopped" dialog)
+                defaultHandler?.uncaughtException(thread, throwable)
+            }
         }
     }
 }

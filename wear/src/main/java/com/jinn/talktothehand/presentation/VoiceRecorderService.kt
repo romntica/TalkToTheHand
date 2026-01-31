@@ -70,7 +70,6 @@ class VoiceRecorderService : Service() {
         recorder = VoiceRecorder(applicationContext)
         fileTransferManager = FileTransferManager(applicationContext)
         
-        // Initialize and cache system services
         notificationManager = getSystemService(NotificationManager::class.java)
         vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val vm = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
@@ -115,17 +114,26 @@ class VoiceRecorderService : Service() {
         } else {
             vibrate(VIBRATION_START)
             config.sessionChunkCount = 0
-            startNewSession("Toggle")
-            startMonitoring()
+            if (startNewSession("Toggle")) {
+                startMonitoring()
+            } else {
+                notifyStatusChanged(error = "Failed to start recording")
+            }
         }
     }
 
     private fun handleStartAction() {
         if (recorder?.isRecording != true) {
             config.sessionChunkCount = 0
-            startNewSession("Manual")
+            if (startNewSession("Manual")) {
+                startMonitoring()
+            } else {
+                notifyStatusChanged(error = "Failed to start recording")
+            }
+        } else {
+            startMonitoring()
+            notifyStatusChanged() // Confirm already recording
         }
-        startMonitoring()
     }
 
     fun startNewSession(reason: String): Boolean {
@@ -138,8 +146,10 @@ class VoiceRecorderService : Service() {
         if (started) {
             config.isRecording = true
             updateComplications()
+            notifyStatusChanged()
         } else {
             sessionLock.unlock()
+            config.isRecording = false
         }
         return started
     }
@@ -228,8 +238,18 @@ class VoiceRecorderService : Service() {
             file?.let { f -> processFinalFile(f, duration) }
         }
         
+        notifyStatusChanged()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    private fun notifyStatusChanged(error: String? = null) {
+        val intent = Intent(ACTION_STATUS_CHANGED).apply {
+            putExtra(EXTRA_IS_RECORDING, config.isRecording)
+            error?.let { putExtra(EXTRA_ERROR, it) }
+            setPackage(packageName)
+        }
+        sendBroadcast(intent)
     }
 
     private fun processFinalFile(file: File, durationMillis: Long) {
@@ -276,7 +296,11 @@ class VoiceRecorderService : Service() {
         const val ACTION_START_FOREGROUND = "com.jinn.talktothehand.action.START_FOREGROUND"
         const val ACTION_STOP_FOREGROUND = "com.jinn.talktothehand.action.STOP_FOREGROUND"
         const val ACTION_TOGGLE_RECORDING = "com.jinn.talktothehand.action.TOGGLE_RECORDING"
-        
+
+        const val ACTION_STATUS_CHANGED = "com.jinn.talktothehand.action.STATUS_CHANGED"
+        const val EXTRA_IS_RECORDING = "is_recording"
+        const val EXTRA_ERROR = "error_message"
+
         private val VIBRATION_START = VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE)
         private val VIBRATION_STOP = VibrationEffect.createWaveform(longArrayOf(0, 50, 50, 50), -1)
     }
