@@ -7,25 +7,39 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 
 /**
- * UI State Management for Settings, as per project standards.
+ * UI State Management for Settings.
  * Holds draft values until 'Apply' is clicked.
+ * Now triggers Guardian upon application to ensure immediate effect.
  */
 class SettingsViewModel(application: Application) : AndroidViewModel(application) {
     private val config = RecorderConfig(application)
+    private val guardian = RecordingGuardian(application)
 
-    var autoStart by mutableStateOf(config.isAutoStartEnabled)
-    var telemetry by mutableStateOf(config.isTelemetryEnabled)
-    var chunkSize by mutableStateOf(config.maxChunkSizeMb)
-    var storageSize by mutableStateOf(config.maxStorageSizeMb)
-    var aggressiveVad by mutableStateOf(config.isAggressiveVadEnabled)
-    var silenceThreshold by mutableStateOf(config.silenceThreshold)
+    var autoStart: Boolean by mutableStateOf(config.isAutoStartEnabled)
+    var telemetry: Boolean by mutableStateOf(config.isTelemetryEnabled)
+    var chunkSize: Int by mutableStateOf(config.maxChunkSizeMb)
+    var storageSize: Int by mutableStateOf(config.maxStorageSizeMb)
+    var aggressiveVad: Boolean by mutableStateOf(config.isAggressiveVadEnabled)
+    var silenceThreshold: Int by mutableStateOf(config.silenceThreshold)
+    var bitrate: Int by mutableStateOf(config.bitrate)
+    var samplingRate: Int by mutableStateOf(config.samplingRate)
 
+    /**
+     * Persists settings and immediately reconciles state.
+     */
     fun applySettings() {
-        config.isAutoStartEnabled = autoStart
-        config.isTelemetryEnabled = telemetry
-        config.maxChunkSizeMb = chunkSize
-        config.maxStorageSizeMb = storageSize
-        config.isAggressiveVadEnabled = aggressiveVad
-        config.silenceThreshold = silenceThreshold
+        config.saveBatch(
+            autoStart = autoStart,
+            telemetry = telemetry,
+            chunkSizeMb = chunkSize,
+            storageSizeMb = storageSize,
+            bitrate = bitrate,
+            samplingRate = samplingRate,
+            silenceThreshold = silenceThreshold,
+            isAggressiveVad = aggressiveVad
+        )
+        
+        // Trigger Guardian to start/stop engine based on NEW settings immediately
+        guardian.handleStartup(isBoot = false)
     }
 }

@@ -41,6 +41,10 @@ class VoiceRecordingListenerService : WearableListenerService() {
         // Path constants
         const val PATH_VOICE_RECORDING = "/voice_recording"
         const val PATH_TELEMETRY_LOG = "/telemetry/log"
+
+        // ACK Paths (Sync with Wear constants)
+        const val PATH_VOICE_ACK = "/voice_recording_ack"
+        const val PATH_TELEMETRY_ACK = "/telemetry_ack"
     }
 
     override fun onMessageReceived(messageEvent: MessageEvent) {
@@ -80,7 +84,7 @@ class VoiceRecordingListenerService : WearableListenerService() {
             try {
                 val inputStream = Tasks.await(channelClient.getInputStream(channel), 10000, java.util.concurrent.TimeUnit.MILLISECONDS)
 
-                // Determine destination based on path
+                // Determine destination based on path. Using 'Logs' subfolder for telemetry.
                 val relativePath = if (isLog) {
                     Environment.DIRECTORY_DOWNLOADS + "/TalkToTheHand/Logs"
                 } else {
@@ -120,8 +124,13 @@ class VoiceRecordingListenerService : WearableListenerService() {
                         contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
                         resolver.update(uri, contentValues, null, null)
 
-                        // Send ACK back to watch to trigger local deletion
-                        sendAck(senderNodeId, rawFileName)
+                        // Send appropriate ACK back to watch
+                        if (isLog) {
+                            sendTelemetryAck(senderNodeId)
+                        } else {
+                            sendAck(senderNodeId, rawFileName)
+                        }
+
                         sendTransferStatus(STATUS_COMPLETED, rawFileName)
                         Log.d(TAG, "File saved to $relativePath: $rawFileName")
                     } else {
@@ -197,7 +206,12 @@ class VoiceRecordingListenerService : WearableListenerService() {
     
     private fun sendAck(nodeId: String, fileName: String) {
         Wearable.getMessageClient(this)
-            .sendMessage(nodeId, "/voice_recording_ack", fileName.toByteArray())
+            .sendMessage(nodeId, PATH_VOICE_ACK, fileName.toByteArray())
+    }
+
+    private fun sendTelemetryAck(nodeId: String) {
+        Wearable.getMessageClient(this)
+            .sendMessage(nodeId, PATH_TELEMETRY_ACK, ByteArray(0))
     }
     
     private fun sendTransferStatus(status: String, fileName: String) {

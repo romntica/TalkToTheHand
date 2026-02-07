@@ -14,31 +14,31 @@ import java.util.Locale
 
 /**
  * Diagnostic logger that sends structured logs to the phone companion.
- * Standardizes log format as per AGENTS.md requirements.
+ * Optimized to prevent Startup ANR by lazy initialization.
  */
 class RemoteLogger(private val context: Context) {
 
-    private val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-    private val batteryStatus: Intent? by lazy {
-        try {
-            context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+    private val activityManager by lazy { context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager }
+
+    // Lazy battery check to avoid blocking the main thread during startup
+    private fun getBatteryLevel(): Float {
+        return try {
+            val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+            val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+            if (level != -1 && scale != -1) (level * 100 / scale.toFloat()) else -1f
         } catch (e: Exception) {
-            null
+            -1f
         }
     }
 
-    init {
-        // Automatically setup crash handler if not already set
-        setupCrashHandler()
-    }
-
     /**
-     * Set up a global exception handler to capture and log app crashes.
+     * Explicitly setup crash handler. Should be called from Application.onCreate() 
+     * or a background thread, not during sensitive service startups.
      */
-    private fun setupCrashHandler() {
+    fun setupCrashHandler() {
         val currentHandler = Thread.getDefaultUncaughtExceptionHandler()
         if (currentHandler is GlobalCrashHandler) return
-
         Thread.setDefaultUncaughtExceptionHandler(GlobalCrashHandler(context, currentHandler))
     }
 
@@ -53,10 +53,8 @@ class RemoteLogger(private val context: Context) {
         val systemInfo = getSystemMetadata()
         val stacktrace = throwable?.let { "\n[Stacktrace]\n${Log.getStackTraceString(it)}" } ?: ""
 
-        // Structured Payload as per AGENTS.md
         val payload = "[$timestamp] [$level] [$tag] $message\n[SystemInfo] $systemInfo$stacktrace"
         
-        // Log to local Logcat
         when (level) {
             "INFO" -> Log.i(tag, message)
             "WARN" -> Log.w(tag, message)
@@ -67,12 +65,7 @@ class RemoteLogger(private val context: Context) {
     }
 
     private fun getSystemMetadata(): String {
-        val batteryPct = batteryStatus?.let { intent ->
-            val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
-            val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
-            if (level != -1 && scale != -1) (level * 100 / scale.toFloat()) else -1f
-        } ?: -1f
-
+        val batteryPct = getBatteryLevel()
         val memoryInfo = ActivityManager.MemoryInfo()
         activityManager.getMemoryInfo(memoryInfo)
         
@@ -91,9 +84,6 @@ class RemoteLogger(private val context: Context) {
         }
     }
 
-    /**
-     * Inner class to handle uncaught exceptions across all threads.
-     */
     private class GlobalCrashHandler(
         private val context: Context,
         private val defaultHandler: Thread.UncaughtExceptionHandler?
@@ -101,6 +91,7 @@ class RemoteLogger(private val context: Context) {
 
         override fun uncaughtException(thread: Thread, throwable: Throwable) {
             try {
+                // Use a fresh instance for crash logging
                 val logger = RemoteLogger(context)
                 logger.log(
                     level = "ERROR",
@@ -111,7 +102,6 @@ class RemoteLogger(private val context: Context) {
             } catch (e: Exception) {
                 Log.e("CrashHandler", "Error logging crash", e)
             } finally {
-                // Pass control back to system (shows "App has stopped" dialog)
                 defaultHandler?.uncaughtException(thread, throwable)
             }
         }

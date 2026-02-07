@@ -12,12 +12,18 @@
     <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
+        android:name=".RecorderApplication"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.TalkToTheHand">
+        android:theme="@style/Theme.TalkToTheHand"
+        android:directBootAware="true">
+
+        <meta-data
+            android:name="com.google.android.wearable.standalone"
+            android:value="true" />
 
         <activity
             android:name=".presentation.MainActivity"
@@ -38,7 +44,6 @@
             android:exported="false"
             android:label="Settings" />
 
-        <!-- Truly Transparent Bridge Activity -->
         <activity
             android:name=".presentation.TransparentServiceLauncherActivity"
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
@@ -46,19 +51,56 @@
             android:noHistory="true"
             android:taskAffinity=""
             android:launchMode="singleInstance"
-            android:exported="false">
+            android:exported="true">
             <meta-data android:name="android.windowDisablePreview" android:value="true" />
         </activity>
 
+        <!-- Isolated Recorder Engine -->
         <service
             android:name=".presentation.VoiceRecorderService"
+            android:process=":recorder"
             android:foregroundServiceType="microphone"
             android:exported="false" />
 
+        <!-- Complications: Merged into Main Process for boot efficiency -->
         <service
             android:name=".presentation.QuickRecordIconComplicationService"
             android:icon="@drawable/ic_complication_record"
             android:label="Quick Record (Icon)"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data
+                android:name="android.support.wearable.complications.SUPPORTED_TYPES"
+                android:value="SMALL_IMAGE,SHORT_TEXT" />
+            <meta-data
+                android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS"
+                android:value="0" />
+        </service>
+
+        <service
+            android:name=".presentation.RecordingProgressComplicationService"
+            android:icon="@drawable/ic_complication_record"
+            android:label="Recording Progress"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data
+                android:name="android.support.wearable.complications.SUPPORTED_TYPES"
+                android:value="RANGED_VALUE,SMALL_IMAGE,SHORT_TEXT" />
+            <meta-data
+                android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS"
+                android:value="0" />
+        </service>
+
+        <service
+            android:name=".presentation.QuickRecordComplicationService"
+            android:icon="@drawable/ic_complication_record"
+            android:label="Quick Record (Advanced)"
             android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER"
             android:exported="true">
             <intent-filter>
@@ -72,46 +114,38 @@
                 android:value="0" />
         </service>
 
-        <service
-            android:name=".presentation.RecordingProgressComplicationService"
-            android:icon="@drawable/ic_complication_record"
-            android:label="Recording Progress (Visual)"
-            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER"
-            android:exported="true">
+        <receiver android:name=".presentation.RecordingGuardian$ReportReceiver"
+            android:exported="false"
+            android:directBootAware="true">
             <intent-filter>
-                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+                <action android:name="com.jinn.talktothehand.action.STATE_CHANGED" />
+                <action android:name="com.jinn.talktothehand.action.FILE_READY" />
+                <action android:name="android.intent.action.SCREEN_ON" />
             </intent-filter>
-            <meta-data
-                android:name="android.support.wearable.complications.SUPPORTED_TYPES"
-                android:value="RANGED_VALUE" />
-            <meta-data
-                android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS"
-                android:value="0" />
-        </service>
+        </receiver>
 
-        <service
-            android:name=".presentation.ConfigListenerService"
-            android:exported="true">
+        <service android:name=".presentation.ConfigListenerService" android:exported="true">
             <intent-filter>
                 <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
                 <data android:scheme="wear" android:host="*" android:pathPrefix="/config"/>
             </intent-filter>
         </service>
 
-        <service
-            android:name=".presentation.TransferAckListenerService"
-            android:exported="true">
+        <service android:name=".presentation.TransferAckListenerService" android:exported="true">
             <intent-filter>
                 <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
                 <data android:scheme="wear" android:host="*" android:pathPrefix="/voice_recording_ack"/>
+                <data android:scheme="wear" android:host="*" android:pathPrefix="/telemetry_ack"/>
             </intent-filter>
         </service>
 
         <receiver
             android:name=".presentation.BootReceiver"
-            android:exported="true">
+            android:exported="true"
+            android:directBootAware="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
 

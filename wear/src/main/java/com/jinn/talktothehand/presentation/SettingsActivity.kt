@@ -12,11 +12,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.input.rotary.onRotaryScrollEvent
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.wear.compose.material.*
 import androidx.wear.compose.material.dialog.Dialog
 import com.jinn.talktothehand.presentation.theme.TalkToTheHandTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Ultra-performance Settings Activity.
@@ -38,17 +42,40 @@ fun SettingsScreen(
     viewModel: SettingsViewModel = viewModel(),
     onDismiss: () -> Unit
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val listState = rememberScalingLazyListState()
     val focusRequester = remember { FocusRequester() }
     
     var showChunkDialog by remember { mutableStateOf(false) }
     var showStorageDialog by remember { mutableStateOf(false) }
     var showVadDialog by remember { mutableStateOf(false) }
+    var showBitrateDialog by remember { mutableStateOf(false) }
+    var showSamplingRateDialog by remember { mutableStateOf(false) }
+
+    // Optimization: Stable string values to prevent re-calculation during scroll
+    val bitrateText = remember(viewModel.bitrate) { "${viewModel.bitrate / 1000} kbps" }
+    val samplingRateText = remember(viewModel.samplingRate) { "${viewModel.samplingRate / 1000} kHz" }
+    val storageText = remember(viewModel.storageSize) { 
+        if (viewModel.storageSize >= 1024) "1 GB" else "${viewModel.storageSize} MB" 
+    }
+    val chunkText = remember(viewModel.chunkSize) { "${viewModel.chunkSize} MB" }
+    val vadSensitivityText = remember(viewModel.silenceThreshold) { "${viewModel.silenceThreshold}" }
+    
+    // Boolean state labels
+    val autoStartText = remember(viewModel.autoStart) { if (viewModel.autoStart) "Enabled" else "Disabled" }
+    val telemetryText = remember(viewModel.telemetry) { if (viewModel.telemetry) "Enabled" else "Disabled" }
+    val aggressiveVadText = remember(viewModel.aggressiveVad) { if (viewModel.aggressiveVad) "ON" else "OFF" }
 
     // Optimization: Pre-calculate handlers to keep lambdas stable
     val onAutoToggle = remember { { viewModel.autoStart = !viewModel.autoStart } }
     val onTeleToggle = remember { { viewModel.telemetry = !viewModel.telemetry } }
     val onVadToggle = remember { { viewModel.aggressiveVad = !viewModel.aggressiveVad } }
+    val onShowChunkDialog = remember { { showChunkDialog = true } }
+    val onShowStorageDialog = remember { { showStorageDialog = true } }
+    val onShowVadDialog = remember { { showVadDialog = true } }
+    val onShowBitrateDialog = remember { { showBitrateDialog = true } }
+    val onShowSamplingRateDialog = remember { { showSamplingRateDialog = true } }
 
     LaunchedEffect(Unit) {
         focusRequester.requestFocus()
@@ -84,7 +111,7 @@ fun SettingsScreen(
                 Chip(
                     onClick = onAutoToggle,
                     label = { Text("Auto Start") },
-                    secondaryLabel = { Text(if (viewModel.autoStart) "Enabled" else "Disabled") },
+                    secondaryLabel = { Text(autoStartText) },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ChipDefaults.secondaryChipColors()
                 )
@@ -95,7 +122,29 @@ fun SettingsScreen(
                 Chip(
                     onClick = onTeleToggle,
                     label = { Text("Telemetry Log") },
-                    secondaryLabel = { Text(if (viewModel.telemetry) "Enabled" else "Disabled") },
+                    secondaryLabel = { Text(telemetryText) },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ChipDefaults.secondaryChipColors()
+                )
+            }
+
+            // Item: Audio Bitrate
+            item(key = "br") {
+                Chip(
+                    onClick = onShowBitrateDialog,
+                    label = { Text("Bitrate") },
+                    secondaryLabel = { Text(bitrateText) },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ChipDefaults.secondaryChipColors()
+                )
+            }
+
+            // Item: Sampling Rate
+            item(key = "sr") {
+                Chip(
+                    onClick = onShowSamplingRateDialog,
+                    label = { Text("Sampling Rate") },
+                    secondaryLabel = { Text(samplingRateText) },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ChipDefaults.secondaryChipColors()
                 )
@@ -104,9 +153,9 @@ fun SettingsScreen(
             // Item: Chunk Limit
             item(key = "cl") {
                 Chip(
-                    onClick = { showChunkDialog = true },
+                    onClick = onShowChunkDialog,
                     label = { Text("Chunk Limit") },
-                    secondaryLabel = { Text("${viewModel.chunkSize} MB") },
+                    secondaryLabel = { Text(chunkText) },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ChipDefaults.secondaryChipColors()
                 )
@@ -115,11 +164,9 @@ fun SettingsScreen(
             // Item: Total Quota
             item(key = "sq") {
                 Chip(
-                    onClick = { showStorageDialog = true },
+                    onClick = onShowStorageDialog,
                     label = { Text("Total Quota") },
-                    secondaryLabel = { 
-                        Text(if (viewModel.storageSize >= 1024) "1 GB" else "${viewModel.storageSize} MB")
-                    },
+                    secondaryLabel = { Text(storageText) },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ChipDefaults.secondaryChipColors()
                 )
@@ -130,7 +177,7 @@ fun SettingsScreen(
                 Chip(
                     onClick = onVadToggle,
                     label = { Text("Aggressive VAD") },
-                    secondaryLabel = { Text(if (viewModel.aggressiveVad) "ON" else "OFF") },
+                    secondaryLabel = { Text(aggressiveVadText) },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ChipDefaults.secondaryChipColors()
                 )
@@ -139,9 +186,9 @@ fun SettingsScreen(
             // Item: VAD Sensitivity
             item(key = "vs") {
                 Chip(
-                    onClick = { showVadDialog = true },
+                    onClick = onShowVadDialog,
                     label = { Text("VAD Sensitivity") },
-                    secondaryLabel = { Text("${viewModel.silenceThreshold}") },
+                    secondaryLabel = { Text(vadSensitivityText) },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ChipDefaults.secondaryChipColors()
                 )
@@ -151,9 +198,14 @@ fun SettingsScreen(
             item(key = "app") {
                 Button(
                     onClick = {
-                        viewModel.applySettings()
-                        Toast.makeText(viewModel.getApplication(), "Applied", Toast.LENGTH_SHORT).show()
-                        onDismiss()
+                        scope.launch {
+                            // Offload blocking IO to background dispatcher
+                            withContext(Dispatchers.IO) {
+                                viewModel.applySettings()
+                            }
+                            Toast.makeText(context, "Applied", Toast.LENGTH_SHORT).show()
+                            onDismiss()
+                        }
                     },
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp)
                 ) {
@@ -165,14 +217,30 @@ fun SettingsScreen(
         }
     }
 
-    // Picker Dialogs
+    // Picker Dialogs - Moved list rememberings here to isolate scope
+    if (showBitrateDialog) {
+        val options = remember { listOf(16000, 32000, 64000, 128000) }
+        OptionPicker("Bitrate", options, viewModel.bitrate,
+            { viewModel.bitrate = it; showBitrateDialog = false }, { showBitrateDialog = false },
+            { "${it / 1000} kbps" })
+    }
+
+    if (showSamplingRateDialog) {
+        val options = remember { listOf(8000, 16000, 44100, 48000) }
+        OptionPicker("Sampling Rate", options, viewModel.samplingRate,
+            { viewModel.samplingRate = it; showSamplingRateDialog = false }, { showSamplingRateDialog = false },
+            { "${it / 1000} kHz" })
+    }
+
     if (showChunkDialog) {
-        OptionPicker("Chunk Size", remember { listOf(1, 2, 5, 10, 15) }, viewModel.chunkSize, 
+        val options = remember { listOf(1, 2, 5, 10, 15) }
+        OptionPicker("Chunk Size", options, viewModel.chunkSize, 
             { viewModel.chunkSize = it; showChunkDialog = false }, { showChunkDialog = false })
     }
 
     if (showStorageDialog) {
-        OptionPicker("Max Storage", remember { listOf(100, 200, 500, 1024) }, viewModel.storageSize,
+        val options = remember { listOf(100, 200, 500, 1024) }
+        OptionPicker("Max Storage", options, viewModel.storageSize,
             { viewModel.storageSize = it; showStorageDialog = false }, { showStorageDialog = false },
             { if (it >= 1024) "1 GB" else "$it MB" })
     }
@@ -219,11 +287,13 @@ private fun OptionPicker(
         ) {
             item { ListHeader { Text(title) } }
             items(options) { opt ->
+                val label = remember(opt) { formatter(opt) }
+                val isSelected = opt == selected
                 Chip(
                     onClick = { onSelect(opt) },
-                    label = { Text(formatter(opt)) },
+                    label = { Text(label) },
                     modifier = Modifier.fillMaxWidth(),
-                    colors = if (opt == selected) ChipDefaults.primaryChipColors() else ChipDefaults.secondaryChipColors()
+                    colors = if (isSelected) ChipDefaults.primaryChipColors() else ChipDefaults.secondaryChipColors()
                 )
             }
         }

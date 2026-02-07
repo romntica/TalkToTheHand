@@ -87,18 +87,23 @@ class FileTransferManager(private val context: Context) {
             }
         }
 
-        // 2. Trigger Telemetry Sync (Method B)
+        // 2. Trigger Telemetry Sync
         transferTelemetryLog()
     }
     
     private fun schedulePeriodicSync() {
-        val syncWork = PeriodicWorkRequestBuilder<PendingFilesCheckWorker>(15, TimeUnit.MINUTES)
-            .setConstraints(Constraints.Builder().setRequiresBatteryNotLow(true).build())
+        // [UX Optimization] Changed from 15 minutes to 24 hours to save battery.
+        // Periodic work acts as a daily cleanup for any failed or abandoned transfers.
+        val syncWork = PeriodicWorkRequestBuilder<PendingFilesCheckWorker>(24, TimeUnit.HOURS)
+            .setConstraints(Constraints.Builder()
+                .setRequiresBatteryNotLow(true)
+                .setRequiresCharging(false) // Daily check doesn't necessarily need charging
+                .build())
             .build()
 
         WorkManager.getInstance(context).enqueueUniquePeriodicWork(
             PendingFilesCheckWorker.UNIQUE_WORK_NAME,
-            ExistingPeriodicWorkPolicy.KEEP,
+            ExistingPeriodicWorkPolicy.UPDATE, // Update existing 15m work to 24h
             syncWork
         )
     }
@@ -146,7 +151,6 @@ class FileTransferWorker(context: Context, workerParams: WorkerParameters) : Cor
 
 /**
  * Worker specifically for Telemetry Logs.
- * Sends to a dedicated path so phone knows how to handle it.
  */
 class TelemetryTransferWorker(context: Context, workerParams: WorkerParameters) : CoroutineWorker(context, workerParams) {
     override suspend fun doWork(): Result {
@@ -157,7 +161,6 @@ class TelemetryTransferWorker(context: Context, workerParams: WorkerParameters) 
         return try {
             val phoneNode = getPhoneNode(applicationContext) ?: return Result.retry()
             val channelClient = Wearable.getChannelClient(applicationContext)
-            // Dedicated path for logs
             val channelPath = "/telemetry/log/${file.name}"
 
             val channel = withContext(Dispatchers.IO) { Tasks.await(channelClient.openChannel(phoneNode.id, channelPath)) }
@@ -166,7 +169,6 @@ class TelemetryTransferWorker(context: Context, workerParams: WorkerParameters) 
             withContext(Dispatchers.IO) {
                 outputStream.use { out -> file.inputStream().use { input -> input.copyTo(out) } }
             }
-            // Note: We don't delete here. Delete only after mobile sends ACK to TransferAckListenerService.
             Result.success()
         } catch (e: Exception) {
             Result.retry()
@@ -179,9 +181,6 @@ class TelemetryTransferWorker(context: Context, workerParams: WorkerParameters) 
     }
 }
 
-/**
- * Helper to find the connected phone node.
- */
 suspend fun getPhoneNode(context: Context): com.google.android.gms.wearable.Node? {
     val nodeClient = Wearable.getNodeClient(context)
     return withContext(Dispatchers.IO) {

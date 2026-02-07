@@ -1,123 +1,89 @@
 package com.jinn.talktothehand.presentation
 
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.DashPathEffect
-import android.graphics.Paint
-import android.graphics.RectF
 import android.graphics.drawable.Icon
-import androidx.wear.watchface.complications.data.ComplicationData
-import androidx.wear.watchface.complications.data.ComplicationType
-import androidx.wear.watchface.complications.data.PlainComplicationText
-import androidx.wear.watchface.complications.data.SmallImage
-import androidx.wear.watchface.complications.data.SmallImageComplicationData
-import androidx.wear.watchface.complications.data.SmallImageType
+import android.util.Log
+import androidx.wear.watchface.complications.data.*
 import androidx.wear.watchface.complications.datasource.ComplicationRequest
 import androidx.wear.watchface.complications.datasource.ComplicationDataSourceService
 import com.jinn.talktothehand.R
+import kotlinx.coroutines.*
 
 /**
- * Data source for the "Progress Record" watch face complication.
- * Correctly uses SmallImageComplicationData.Builder to provide tap actions.
+ * Super-optimized Icon Complication.
+ * Actively triggers state integrity check before providing data.
  */
 class QuickRecordComplicationService : ComplicationDataSourceService() {
+
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    companion object {
+        private const val TAG = "QuickComplication"
+    }
 
     override fun onComplicationRequest(
         request: ComplicationRequest,
         listener: ComplicationRequestListener
     ) {
-        if (request.complicationType != ComplicationType.SMALL_IMAGE) {
-            listener.onComplicationData(null)
-            return
+        Log.d(TAG, "Request received: ${request.complicationType}")
+
+        serviceScope.launch {
+            try {
+                val context = applicationContext
+                val guardian = RecordingGuardian(context)
+                
+                // 1. Force state correction before responding
+                guardian.verifyIntegrity()
+
+                // 2. Read the corrected state
+                val state = SessionState(context).read()
+                
+                // 3. Select UI Assets
+                val iconResId = when {
+                    state.isPaused -> R.drawable.ic_complication_stop
+                    state.isRecording -> R.drawable.ic_complication_record
+                    else -> R.drawable.ic_complication_stop
+                }
+
+                // 4. Build Intent
+                val tapIntent = Intent(context, TransparentServiceLauncherActivity::class.java).apply {
+                    action = VoiceRecorderService.ACTION_TOGGLE_RECORDING
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                }
+                val pendingIntent = PendingIntent.getActivity(
+                    context, request.complicationInstanceId, tapIntent,
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+
+                // 5. Construct Data
+                val data = SmallImageComplicationData.Builder(
+                    smallImage = SmallImage.Builder(Icon.createWithResource(context, iconResId), SmallImageType.ICON).build(),
+                    contentDescription = PlainComplicationText.Builder("Quick Record").build()
+                )
+                .setTapAction(pendingIntent)
+                .build()
+
+                listener.onComplicationData(data)
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Async error", e)
+                listener.onComplicationData(null)
+            }
         }
-
-        val config = RecorderConfig(this)
-        val totalChunks = config.sessionChunkCount
-
-        // 1. Draw custom visualization bitmap
-        val bitmap = drawProgressBitmap(0L, config.maxChunkSizeBytes, totalChunks)
-        val icon = Icon.createWithBitmap(bitmap)
-
-        // 2. Prepare intent
-        val intent = Intent(this, MainActivity::class.java).apply {
-            action = MainActivity.ACTION_QUICK_RECORD
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        }
-
-        val pendingIntent = PendingIntent.getActivity(
-            this, request.complicationInstanceId, intent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
-        // 3. Proper layering: SmallImage wrapped by SmallImageComplicationData
-        val smallImage = SmallImage.Builder(
-            image = icon,
-            type = SmallImageType.ICON
-        ).build()
-
-        val data = SmallImageComplicationData.Builder(
-            smallImage = smallImage,
-            contentDescription = PlainComplicationText.Builder("Recording Progress").build()
-        )
-            .setTapAction(pendingIntent)
-            .build()
-
-        listener.onComplicationData(data)
     }
 
-    private fun drawProgressBitmap(currentSize: Long, maxSize: Long, chunkCount: Int): Bitmap {
-        val size = 96
-        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
-        val rect = RectF(10f, 10f, size - 10f, size - 10f)
-        
-        val bgPaint = Paint().apply {
-            color = Color.DKGRAY
-            style = Paint.Style.STROKE
-            strokeWidth = 6f
-            pathEffect = DashPathEffect(floatArrayOf(5f, 5f), 0f)
-            isAntiAlias = true
-        }
-        canvas.drawArc(rect, 0f, 360f, false, bgPaint)
-
-        val progress = if (maxSize > 0) (currentSize.toFloat() / maxSize).coerceIn(0f, 1f) else 0f
-        val progressPaint = Paint().apply {
-            color = Color.GREEN
-            style = Paint.Style.STROKE
-            strokeWidth = 8f
-            strokeCap = Paint.Cap.ROUND
-            isAntiAlias = true
-        }
-        canvas.drawArc(rect, -90f, 360f * progress, false, progressPaint)
-
-        val chunkPaint = Paint().apply {
-            color = Color.CYAN
-            style = Paint.Style.STROKE
-            strokeWidth = 10f
-            isAntiAlias = true
-        }
-        val chunkStep = 20f
-        for (i in 0 until chunkCount) {
-            val startAngle = (i * (chunkStep + 5f)) % 360f
-            canvas.drawArc(rect, startAngle, chunkStep, false, chunkPaint)
-        }
-        return bitmap
+    override fun onDestroy() {
+        serviceScope.cancel()
+        super.onDestroy()
     }
 
     override fun getPreviewData(type: ComplicationType): ComplicationData? {
-        if (type != ComplicationType.SMALL_IMAGE) return null
-        
-        val previewImage = SmallImage.Builder(
-            image = Icon.createWithResource(this, R.drawable.ic_complication_record),
-            type = SmallImageType.ICON
-        ).build()
-
+        val icon = Icon.createWithResource(this, R.drawable.ic_complication_record)
         return SmallImageComplicationData.Builder(
-            smallImage = previewImage,
-            contentDescription = PlainComplicationText.Builder("Quick Record Preview").build()
+            SmallImage.Builder(icon, SmallImageType.ICON).build(),
+            PlainComplicationText.Builder("Record").build()
         ).build()
     }
 }

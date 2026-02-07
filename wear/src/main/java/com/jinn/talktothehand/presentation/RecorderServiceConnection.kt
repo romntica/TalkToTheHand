@@ -4,68 +4,100 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
-import android.os.IBinder
+import android.os.*
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * Manages the connection to the VoiceRecorderService.
- * Exposes the VoiceRecorder instance as a reactive StateFlow.
+ * Data class representing the real-time status of the recording engine.
+ */
+data class EngineStatus(
+    val isRecording: Boolean = false,
+    val isPaused: Boolean = false,
+    val elapsedMillis: Long = 0L,
+    val currentFileSize: Long = 0L,
+    val error: String? = null
+)
+
+/**
+ * Manages the connection to the VoiceRecorderService using Messenger for IPC.
  */
 class RecorderServiceConnection(private val context: Context) {
 
-    private val _recorderFlow = MutableStateFlow<VoiceRecorder?>(null)
-    val recorderFlow: StateFlow<VoiceRecorder?> = _recorderFlow.asStateFlow()
+    private val _engineStatus = MutableStateFlow(EngineStatus())
+    val engineStatus: StateFlow<EngineStatus> = _engineStatus.asStateFlow()
 
-    private var boundService: VoiceRecorderService? = null
+    private var serviceMessenger: Messenger? = null
     private var isBound = false
+
+    private val clientMessenger = Messenger(object : Handler(Looper.getMainLooper()) {
+        override fun handleMessage(msg: Message) {
+            if (msg.what == VoiceRecorderService.MSG_STATUS_UPDATE) {
+                val isRecording = msg.arg1 == 1
+                val isPaused = msg.arg2 == 1
+                val error = msg.obj as? String
+                val elapsed = msg.data.getLong("elapsed_ms")
+                val size = msg.data.getLong("size_bytes")
+                
+                _engineStatus.value = EngineStatus(isRecording, isPaused, elapsed, size, error)
+            }
+        }
+    })
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(className: ComponentName, service: IBinder) {
-            Log.d(TAG, "Service Connected")
-            val binder = service as? VoiceRecorderService.LocalBinder
-            if (binder == null) {
-                Log.e(TAG, "Unexpected binder type: $service")
-                return
-            }
-            
-            boundService = binder.getService()
-            _recorderFlow.value = binder.getRecorder()
+            serviceMessenger = Messenger(service)
             isBound = true
+            sendRegisterMessage(true)
         }
 
         override fun onServiceDisconnected(arg0: ComponentName) {
-            Log.d(TAG, "Service Disconnected")
-            boundService = null
-            _recorderFlow.value = null
+            serviceMessenger = null
             isBound = false
+            _engineStatus.value = EngineStatus()
         }
     }
 
-    /**
-     * Returns the bound service instance if available.
-     */
-    fun getService(): VoiceRecorderService? = boundService
-
     fun bind() {
         if (!isBound) {
-            val intent = Intent(context, VoiceRecorderService::class.java)
-            context.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+            context.bindService(
+                Intent(context, VoiceRecorderService::class.java),
+                serviceConnection,
+                Context.BIND_AUTO_CREATE
+            )
         }
     }
 
     fun unbind() {
         if (isBound) {
+            sendRegisterMessage(false)
             context.unbindService(serviceConnection)
             isBound = false
-            boundService = null
-            _recorderFlow.value = null
+            serviceMessenger = null
         }
     }
-    
-    companion object {
-        private const val TAG = "RecorderServiceConn"
+
+    private fun sendRegisterMessage(register: Boolean) {
+        try {
+            val what = if (register) VoiceRecorderService.MSG_REGISTER_CLIENT else VoiceRecorderService.MSG_UNREGISTER_CLIENT
+            val msg = Message.obtain(null, what)
+            msg.replyTo = clientMessenger
+            serviceMessenger?.send(msg)
+        } catch (_: RemoteException) { }
+    }
+
+    /**
+     * Sends a control command to the recording engine.
+     */
+    fun sendCommand(what: Int, arg1: Int = 0) {
+        try {
+            val msg = Message.obtain(null, what, arg1, 0)
+            msg.replyTo = clientMessenger
+            serviceMessenger?.send(msg)
+        } catch (e: RemoteException) {
+            Log.e("ServiceConn", "Failed to send command $what", e)
+        }
     }
 }

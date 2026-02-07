@@ -6,31 +6,25 @@ import android.content.Intent
 import android.util.Log
 
 /**
- * Receiver for BOOT_COMPLETED events to handle auto-start functionality.
+ * Lightweight BootReceiver.
+ * Does NOT start MainActivity immediately to prevent system-wide startup ANRs.
+ * Complications will start their own process (:complication) when requested by the system.
  */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
+        val action = intent.action
+        if (action == Intent.ACTION_BOOT_COMPLETED || action == Intent.ACTION_LOCKED_BOOT_COMPLETED) {
             val config = RecorderConfig(context)
+            val sessionLock = SessionLock(context.filesDir)
             
-            if (config.isAutoStartEnabled) {
-                Log.i(TAG, "Boot completed and auto-start is enabled. Initiating background recording.")
-                
-                // Start the service directly to begin recording immediately without UI interaction.
-                val serviceIntent = Intent(context, VoiceRecorderService::class.java).apply {
-                    action = VoiceRecorderService.ACTION_START_FOREGROUND
-                }
-                
-                // Android 8.0+ requires startForegroundService for background starts.
-                context.startForegroundService(serviceIntent)
-                
-                // Also launch MainActivity to provide visual feedback to the user.
-                val launchIntent = Intent(context, MainActivity::class.java).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                context.startActivity(launchIntent)
-            } else {
-                Log.d(TAG, "Boot completed but auto-start is disabled.")
+            val needsAction = config.isAutoStartEnabled || sessionLock.isLocked
+            
+            if (needsAction) {
+                Log.i(TAG, "Boot detected. Deferring functional startup to RecordingGuardian.")
+                // We don't start MainActivity here anymore. 
+                // Instead, the RecordingGuardian (Control Plane) will be triggered 
+                // by the system or when the user eventually opens the app.
+                // This allows the :complication process to have enough resources to start.
             }
         }
     }
