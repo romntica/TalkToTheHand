@@ -19,11 +19,17 @@ import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
+/**
+ * Service to listen for incoming voice recordings and telemetry logs from the Wear OS device.
+ * Optimized for Android 14+ with enhanced resource management and data isolation.
+ */
 class VoiceRecordingListenerService : WearableListenerService() {
 
-    private val executor = Executors.newSingleThreadExecutor()
+    private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     
     companion object {
         const val TAG = "VoiceListener"
@@ -38,13 +44,15 @@ class VoiceRecordingListenerService : WearableListenerService() {
         const val ACTION_CONFIG_RECEIVED = "com.jinn.talktothehand.CONFIG_RECEIVED"
         const val EXTRA_CONFIG_DATA = "config_data"
 
-        // Path constants
-        const val PATH_VOICE_RECORDING = "/voice_recording"
-        const val PATH_TELEMETRY_LOG = "/telemetry/log"
+        // Path constants for data isolation
+        private const val PATH_VOICE_RECORDING = "/voice_recording"
+        private const val PATH_TELEMETRY_LOG = "/telemetry/log"
 
-        // ACK Paths (Sync with Wear constants)
-        const val PATH_VOICE_ACK = "/voice_recording_ack"
-        const val PATH_TELEMETRY_ACK = "/telemetry_ack"
+        // ACK Paths (Synchronized with Wear constants)
+        private const val PATH_VOICE_ACK = "/voice_recording_ack"
+        private const val PATH_TELEMETRY_ACK = "/telemetry_ack"
+        
+        private const val CHANNEL_TIMEOUT_MS = 10000L
     }
 
     override fun onMessageReceived(messageEvent: MessageEvent) {
@@ -70,6 +78,7 @@ class VoiceRecordingListenerService : WearableListenerService() {
         val isAudio = channel.path.startsWith(PATH_VOICE_RECORDING)
         val isLog = channel.path.startsWith(PATH_TELEMETRY_LOG)
 
+        // Only handle registered paths
         if (!isAudio && !isLog) return
 
         Log.d(TAG, "Channel opened: ${channel.path}")
@@ -82,13 +91,14 @@ class VoiceRecordingListenerService : WearableListenerService() {
 
         executor.execute {
             try {
-                val inputStream = Tasks.await(channelClient.getInputStream(channel), 10000, java.util.concurrent.TimeUnit.MILLISECONDS)
+                val inputStream = Tasks.await(channelClient.getInputStream(channel), CHANNEL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
 
-                // Determine destination based on path. Using 'Logs' subfolder for telemetry.
+                // Define destination folder based on data type. 
+                // Telemetry logs are stored in the 'Logs' subfolder of the main 'TalkToTheHand' directory.
                 val relativePath = if (isLog) {
-                    Environment.DIRECTORY_DOWNLOADS + "/TalkToTheHand/Logs"
+                    "${Environment.DIRECTORY_DOWNLOADS}/TalkToTheHand/Logs"
                 } else {
-                    Environment.DIRECTORY_DOWNLOADS + "/TalkToTheHand"
+                    "${Environment.DIRECTORY_DOWNLOADS}/TalkToTheHand"
                 }
 
                 val mimeType = if (isLog) "text/plain" else "audio/aac"
@@ -98,7 +108,9 @@ class VoiceRecordingListenerService : WearableListenerService() {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, rawFileName)
                     put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
                     put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
-                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        put(MediaStore.MediaColumns.IS_PENDING, 1)
+                    }
                 }
 
                 val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
@@ -120,11 +132,13 @@ class VoiceRecordingListenerService : WearableListenerService() {
                     }
 
                     if (success) {
-                        contentValues.clear()
-                        contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                        resolver.update(uri, contentValues, null, null)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            contentValues.clear()
+                            contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                            resolver.update(uri, contentValues, null, null)
+                        }
 
-                        // Send appropriate ACK back to watch
+                        // Send appropriate ACK back to the watch to finalize the transfer on their end.
                         if (isLog) {
                             sendTelemetryAck(senderNodeId)
                         } else {
@@ -146,6 +160,18 @@ class VoiceRecordingListenerService : WearableListenerService() {
             }
         }
     }
+
+    override fun onDestroy() {
+        executor.shutdown()
+        try {
+            if (!executor.awaitTermination(2, TimeUnit.SECONDS)) {
+                executor.shutdownNow()
+            }
+        } catch (e: Exception) {
+            executor.shutdownNow()
+        }
+        super.onDestroy()
+    }
     
     private fun saveLogToFile(message: String) {
         val dateStamp = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
@@ -162,7 +188,7 @@ class VoiceRecordingListenerService : WearableListenerService() {
     @androidx.annotation.RequiresApi(Build.VERSION_CODES.Q)
     private fun saveLogToMediaStore(filename: String, logLine: String) {
         val resolver = contentResolver
-        val relativePath = Environment.DIRECTORY_DOWNLOADS + "/TalkToTheHand/Logs/"
+        val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/TalkToTheHand/Logs/"
         val queryUri = MediaStore.Downloads.EXTERNAL_CONTENT_URI
         val selection = "${MediaStore.Downloads.DISPLAY_NAME} = ? AND ${MediaStore.Downloads.RELATIVE_PATH} = ?"
         val selectionArgs = arrayOf(filename, relativePath)
@@ -186,7 +212,9 @@ class VoiceRecordingListenerService : WearableListenerService() {
             }
 
             if (uri != null) {
-                resolver.openOutputStream(uri, "wa")?.use { it.write(logLine.toByteArray(StandardCharsets.UTF_8)) }
+                resolver.openOutputStream(uri, "wa")?.use { 
+                    it.write(logLine.toByteArray(StandardCharsets.UTF_8)) 
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to save telemetry to MediaStore", e)
@@ -195,10 +223,13 @@ class VoiceRecordingListenerService : WearableListenerService() {
 
     private fun saveLogToLegacyStorage(filename: String, logLine: String) {
         try {
+            @Suppress("DEPRECATION")
             val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
             val logDir = File(downloadsDir, "TalkToTheHand/Logs")
             if (!logDir.exists()) logDir.mkdirs()
-            FileOutputStream(File(logDir, filename), true).use { it.write(logLine.toByteArray(StandardCharsets.UTF_8)) }
+            FileOutputStream(File(logDir, filename), true).use { 
+                it.write(logLine.toByteArray(StandardCharsets.UTF_8)) 
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to save telemetry to legacy storage", e)
         }

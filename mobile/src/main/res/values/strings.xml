@@ -3,4 +3,10 @@
     <string name="status_initializing">Initializing...</string>
     <string name="status_ready">Ready to receive recordings</string>
     <string name="instruction_text">Recordings from your watch will be saved to your Downloads folder.</string>
+
+    <!-- Added for build error resolution and warnings -->
+    <string name="receiving_format">Receiving: %1$s...</string>
+    <string name="saved_format">Saved: %1$s</string>
+    <string name="failed_format">Failed to receive: %1$s</string>
+    <string name="mb_format">%1$d MB</string>
 </resources>

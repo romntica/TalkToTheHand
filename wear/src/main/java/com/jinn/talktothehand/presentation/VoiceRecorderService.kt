@@ -14,7 +14,7 @@ import java.util.Date
 
 /**
  * DATA PLANE: Isolated recording engine running in ':recorder' process.
- * Now resets stats to zero upon stopping to sync UI correctly.
+ * Now includes Battery Guard to prevent crashes and data loss during low power.
  */
 class VoiceRecorderService : Service() {
 
@@ -35,12 +35,13 @@ class VoiceRecorderService : Service() {
 
         private val VIBRATION_STOP = VibrationEffect.createOneShot(100, 80)
         private const val HEARTBEAT_INTERVAL_MS = 30000L
+        private const val BATTERY_CRITICAL_THRESHOLD = 2 // 2%
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var recorder: VoiceRecorder? = null
     private val config by lazy { RecorderConfig(applicationContext) }
-    private val sessionLock by lazy { SessionLock(applicationContext.filesDir) }
+    private val sessionLock by lazy { SessionLock(applicationContext) }
     private val sessionState by lazy { SessionState(applicationContext) }
     private val powerManager by lazy { getSystemService(Context.POWER_SERVICE) as PowerManager }
     
@@ -48,10 +49,16 @@ class VoiceRecorderService : Service() {
     private lateinit var messenger: Messenger
     private var heartbeatCount = 0L
 
-    private val syncReceiver = object : BroadcastReceiver() {
+    private val systemReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == ACTION_SYNC_STATS) {
-                reportStateToGuardian(recorder?.isRecording == true, isPaused = recorder?.isPaused == true, isHeartbeat = false)
+            when (intent?.action) {
+                ACTION_SYNC_STATS -> {
+                    reportStateToGuardian(recorder?.isRecording == true, isPaused = recorder?.isPaused == true, isHeartbeat = false)
+                }
+                Intent.ACTION_BATTERY_LOW -> {
+                    Log.w(TAG, "Battery Low signal received. Checking threshold.")
+                    checkBatteryAndStopIfNeeded()
+                }
             }
         }
     }
@@ -91,12 +98,17 @@ class VoiceRecorderService : Service() {
         recorder = VoiceRecorder(applicationContext)
         messenger = Messenger(IncomingHandler())
         createNotificationChannel()
-        registerReceiver(syncReceiver, IntentFilter(ACTION_SYNC_STATS), RECEIVER_NOT_EXPORTED)
+        
+        val filter = IntentFilter().apply {
+            addAction(ACTION_SYNC_STATS)
+            addAction(Intent.ACTION_BATTERY_LOW)
+        }
+        registerReceiver(systemReceiver, filter, RECEIVER_NOT_EXPORTED)
         updateSyncState()
     }
 
     override fun onDestroy() {
-        try { unregisterReceiver(syncReceiver) } catch (_: Exception) {}
+        try { unregisterReceiver(systemReceiver) } catch (_: Exception) {}
         updateSyncState(false, false)
         super.onDestroy()
     }
@@ -123,6 +135,12 @@ class VoiceRecorderService : Service() {
     private suspend fun startEngine() {
         if (recorder?.isRecording == true) return
         
+        if (getBatteryLevel() <= BATTERY_CRITICAL_THRESHOLD) {
+            Log.e(TAG, "Cannot start engine: Battery too low (${getBatteryLevel()}%)")
+            reportStateToGuardian(false, isPaused = false, isHeartbeat = false, error = "Battery Critical")
+            return
+        }
+
         val timestamp = DateFormat.format("yyyyMMdd_HHmmss", Date()).toString()
         val file = File(applicationContext.filesDir, "${timestamp}_temp.aac")
         
@@ -130,7 +148,8 @@ class VoiceRecorderService : Service() {
         if (recorder?.start(file, "EngineStart") == true) {
             config.isRecording = true
             updateSyncState()
-            reportStateToGuardian(true, isPaused = false, isHeartbeat = true)
+            // CRITICAL: 즉각적인 컴플리케이션 상태 변경을 위해 시작 성공 즉시 보고
+            reportStateToGuardian(true, isPaused = false, isHeartbeat = false)
             startMonitoringLoop()
         } else {
             val error = recorder?.lastError ?: "Hardware Init Failed"
@@ -147,25 +166,33 @@ class VoiceRecorderService : Service() {
             var lastHeartbeatTime = System.currentTimeMillis()
             heartbeatCount = 0
             
+            // 사용자 제안: 청크 크기의 1/30을 업데이트 문턱값으로 설정
+            val sizeThreshold = (config.maxChunkSizeBytes / 30).coerceAtLeast(1024L * 50) // 최소 50KB
+
             while (isActive && recorder?.isRecording == true) {
                 val currentSize = recorder?.currentFileSize ?: 0L
                 val isPaused = recorder?.isPaused == true
+                val now = System.currentTimeMillis()
                 
                 updateSyncState()
 
-                if (powerManager.isInteractive) {
-                    val sizeThreshold = config.maxChunkSizeBytes / 10 
-                    if (currentSize - lastReportedSize > sizeThreshold) {
-                        reportStateToGuardian(true, isPaused = isPaused, isHeartbeat = false)
-                        lastReportedSize = currentSize
-                    }
+                // 주기적인 배터리 체크 (약 6분 간격)
+                if (heartbeatCount % 12 == 0L) {
+                    checkBatteryAndStopIfNeeded()
+                }
+
+                // 사이즈 기반 업데이트: 화면이 켜져 있을 때만 실시간성을 위해 보고
+                if (powerManager.isInteractive && (currentSize - lastReportedSize >= sizeThreshold)) {
+                    reportStateToGuardian(true, isPaused = isPaused, isHeartbeat = false)
+                    lastReportedSize = currentSize
                 }
                 
-                if (System.currentTimeMillis() - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
+                // 하트비트 (30초): 화면이 꺼져 있어도 최소한의 동기화 보장
+                if (now - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
                     heartbeatCount++
                     sessionLock.updateTick() 
                     reportStateToGuardian(true, isPaused = isPaused, isHeartbeat = true)
-                    lastHeartbeatTime = System.currentTimeMillis()
+                    lastHeartbeatTime = now
                     lastReportedSize = currentSize 
                 }
                 
@@ -178,6 +205,24 @@ class VoiceRecorderService : Service() {
                 delay(1000)
             }
         }
+    }
+
+    private fun checkBatteryAndStopIfNeeded() {
+        val level = getBatteryLevel()
+        if (level <= BATTERY_CRITICAL_THRESHOLD && recorder?.isRecording == true) {
+            Log.w(TAG, "Battery critical ($level%). Emergency stop triggered.")
+            serviceScope.launch { 
+                RemoteLogger(applicationContext).warn(TAG, "Emergency Stop: Battery $level%")
+                stopEngine() 
+            }
+        }
+    }
+
+    private fun getBatteryLevel(): Int {
+        val batteryStatus: Intent? = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val level = batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = batteryStatus?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+        return if (level != -1 && scale != -1) (level * 100 / scale.toFloat()).toInt() else 100
     }
 
     private suspend fun performSplit() {
@@ -200,7 +245,6 @@ class VoiceRecorderService : Service() {
         sessionLock.unlock()
         vibrate(VIBRATION_STOP)
         
-        // Final report with zeros to clear UI
         reportStateToGuardian(false, isPaused = false, isHeartbeat = true)
         
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -239,7 +283,6 @@ class VoiceRecorderService : Service() {
             putExtra(RecordingGuardian.EXTRA_IS_RECORDING, isRecording)
             putExtra("is_paused", isPaused)
             putExtra(RecordingGuardian.EXTRA_CHUNK_COUNT, config.sessionChunkCount)
-            // Send 0 if not recording
             putExtra(RecordingGuardian.EXTRA_CURRENT_SIZE, if (isRecording) (recorder?.currentFileSize ?: 0L) else 0L)
             if (error != null) putExtra(RecordingGuardian.EXTRA_ERROR_MESSAGE, error)
             
@@ -262,7 +305,6 @@ class VoiceRecorderService : Service() {
                     arg1 = if (isRecordingNow) 1 else 0
                     arg2 = if (isPausedNow) 1 else 0
                     data = Bundle().apply {
-                        // Reset to 0 when stopped
                         putLong("elapsed_ms", if (isRecordingNow) (recorder?.durationMillis ?: 0L) else 0L)
                         putLong("size_bytes", if (isRecordingNow) (recorder?.currentFileSize ?: 0L) else 0L)
                     }

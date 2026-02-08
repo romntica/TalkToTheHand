@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-feature android:name="android.hardware.type.watch" />
 
@@ -25,6 +26,18 @@
             android:name="com.google.android.wearable.standalone"
             android:value="true" />
 
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge"
+            tools:replace="android:authorities">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
+
         <activity
             android:name=".presentation.MainActivity"
             android:exported="true"
@@ -44,6 +57,7 @@
             android:exported="false"
             android:label="Settings" />
 
+        <!-- CRITICAL: Added directBootAware to allow launcher activity before unlock -->
         <activity
             android:name=".presentation.TransparentServiceLauncherActivity"
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
@@ -51,18 +65,17 @@
             android:noHistory="true"
             android:taskAffinity=""
             android:launchMode="singleInstance"
+            android:directBootAware="true"
             android:exported="true">
             <meta-data android:name="android.windowDisablePreview" android:value="true" />
         </activity>
 
-        <!-- Isolated Recorder Engine -->
         <service
             android:name=".presentation.VoiceRecorderService"
             android:process=":recorder"
             android:foregroundServiceType="microphone"
             android:exported="false" />
 
-        <!-- Complications: Merged into Main Process for boot efficiency -->
         <service
             android:name=".presentation.QuickRecordIconComplicationService"
             android:icon="@drawable/ic_complication_record"
@@ -120,7 +133,6 @@
             <intent-filter>
                 <action android:name="com.jinn.talktothehand.action.STATE_CHANGED" />
                 <action android:name="com.jinn.talktothehand.action.FILE_READY" />
-                <action android:name="android.intent.action.SCREEN_ON" />
             </intent-filter>
         </receiver>
 

@@ -37,7 +37,7 @@ import kotlin.math.sqrt
 
 /**
  * Advanced Voice Recorder with Interruptible Backoff and Enhanced VAD logic.
- * Optimized for v1.2.0 Release using Stable Coroutine APIs.
+ * Optimized for stability and crash resilience.
  */
 class VoiceRecorder(private val context: Context) {
 
@@ -189,13 +189,11 @@ class VoiceRecorder(private val context: Context) {
 
     private suspend fun initializeHardwareWithRetry(): Boolean {
         val startWaitTime = System.currentTimeMillis()
-        var attemptCount = 0
         
         while (System.currentTimeMillis() - startWaitTime < MIC_ACCESS_TIMEOUT_MS) {
-            attemptCount++
             if (initializeHardware()) {
                 val testBuffer = ShortArray(1024)
-                val readResult = audioRecord?.read(testBuffer, 0, testBuffer.size) ?: -1
+                val readResult = try { audioRecord?.read(testBuffer, 0, testBuffer.size) ?: -1 } catch (_: Exception) { -1 }
                 if (readResult > 0) return true
             }
             releaseMediaComponents()
@@ -221,17 +219,17 @@ class VoiceRecorder(private val context: Context) {
                     if (minBufferSize > 0) {
                         sampleRate = rate
                         recordingBufferSize = maxOf(minBufferSize * 2, OPTIMAL_BUFFER_SIZE)
-                        audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, channelConfig, audioFormat, recordingBufferSize)
+                        val recorder = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, channelConfig, audioFormat, recordingBufferSize)
                         
-                        if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
-                            audioRecord?.startRecording()
-                            if (audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                        if (recorder.state == AudioRecord.STATE_INITIALIZED) {
+                            recorder.startRecording()
+                            if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                                audioRecord = recorder
                                 validRateFound = true
                                 break
                             }
                         }
-                        audioRecord?.release()
-                        audioRecord = null
+                        recorder.release()
                     }
                 } catch (_: Exception) {}
             }
@@ -243,12 +241,14 @@ class VoiceRecorder(private val context: Context) {
             format.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC) 
             format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, recordingBufferSize)
             
-            mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
-            mediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            mediaCodec?.start()
+            val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            codec.start()
+            mediaCodec = codec
             
             return true
         } catch (e: Exception) {
+            Log.e(TAG, "Hardware init failed", e)
             return false
         }
     }
@@ -267,6 +267,9 @@ class VoiceRecorder(private val context: Context) {
                 if (currentFileSize >= maxStorageBytes) break
                 if (isPaused) { delay(100); continue }
                 
+                // Hardware Guard: Verify encoder is still alive
+                if (mediaCodec == null || audioRecord == null) break
+
                 val readSize = audioRecord?.read(buffer, 0, buffer.size) ?: -1
                 if (readSize <= 0) {
                     if (readSize == AudioRecord.ERROR_INVALID_OPERATION || readSize == AudioRecord.ERROR_BAD_VALUE) {
@@ -329,12 +332,15 @@ class VoiceRecorder(private val context: Context) {
             } catch (e: Exception) {
                 Log.e(TAG, "Critical loop error", e)
                 lastError = "Loop error: ${e.message}"
-                stateListener?.onError(lastError!!)
+                // Don't call onError here, cleanup will handle state
                 break
             }
         }
         
-        drainOutput(bufferInfo, isEos = true)
+        // Final Drain: Only if encoder is still valid
+        if (mediaCodec != null) {
+            drainOutput(bufferInfo, isEos = true)
+        }
         flushBuffer(forceSync = true)
     }
 
@@ -352,22 +358,18 @@ class VoiceRecorder(private val context: Context) {
 
     /**
      * Aggressive Power Saving: Powers down MIC during deep silence.
-     * Uses Stable withTimeoutOrNull to wait for wakeup signals.
      */
     private suspend fun performAggressiveDutyCycleBackoff() {
         try {
             Log.d(TAG, "Deep silence: Powering down MIC (Backoff: ${currentDutyCycleDelayMs}ms)")
             releaseMediaComponents()
             
-            // STABLE REPLACEMENT: Wait for wakeup signal OR timeout
             val receivedSignal = withTimeoutOrNull(currentDutyCycleDelayMs) {
                 wakeupSignal.receive()
             }
 
             if (receivedSignal != null) {
                 Log.i(TAG, "Backoff interrupted: Immediate wakeup")
-            } else {
-                Log.d(TAG, "Backoff timeout reached: Periodic check")
             }
 
             currentDutyCycleDelayMs = min(currentDutyCycleDelayMs * 2, MAX_DUTY_CYCLE_DELAY_MS)
@@ -384,40 +386,56 @@ class VoiceRecorder(private val context: Context) {
     }
 
     private fun processEncodingRobust(buffer: ShortArray, readSize: Int) {
+        val codec = mediaCodec ?: return
         var offset = 0
-        while (offset < readSize) {
-            val inputIdx = mediaCodec?.dequeueInputBuffer(10000) ?: -1
-            if (inputIdx >= 0) {
-                val inputBuffer = mediaCodec?.getInputBuffer(inputIdx) ?: break
-                inputBuffer.clear()
-                val maxShorts = inputBuffer.capacity() / 2
-                val shortsToPut = min(readSize - offset, maxShorts)
-                inputBuffer.asShortBuffer().put(buffer, offset, shortsToPut)
-                val ptsUs = (totalSamplesProcessed * 1_000_000L) / sampleRate
-                mediaCodec?.queueInputBuffer(inputIdx, 0, shortsToPut * 2, ptsUs, 0)
-                totalSamplesProcessed += shortsToPut
-                offset += shortsToPut
-            } else break
+        try {
+            while (offset < readSize) {
+                val inputIdx = codec.dequeueInputBuffer(10000)
+                if (inputIdx >= 0) {
+                    val inputBuffer = codec.getInputBuffer(inputIdx) ?: break
+                    inputBuffer.clear()
+                    val maxShorts = inputBuffer.capacity() / 2
+                    val shortsToPut = min(readSize - offset, maxShorts)
+                    inputBuffer.asShortBuffer().put(buffer, offset, shortsToPut)
+                    val ptsUs = (totalSamplesProcessed * 1_000_000L) / sampleRate
+                    codec.queueInputBuffer(inputIdx, 0, shortsToPut * 2, ptsUs, 0)
+                    totalSamplesProcessed += shortsToPut
+                    offset += shortsToPut
+                } else break
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Encoding failed: ${e.message}")
         }
     }
 
     private fun drainOutput(info: MediaCodec.BufferInfo, isEos: Boolean = false) {
-        if (isEos) {
-            val inputIdx = mediaCodec?.dequeueInputBuffer(5000) ?: -1
-            if (inputIdx >= 0) mediaCodec?.queueInputBuffer(inputIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-        }
-        var outputIdx = mediaCodec?.dequeueOutputBuffer(info, 0) ?: -1
-        while (outputIdx >= 0) {
-            val encodedData = mediaCodec?.getOutputBuffer(outputIdx)
-            if (encodedData != null && info.size > 0) {
-                val packetSize = info.size + 7
-                if (writeBuffer.remaining() < packetSize) flushBuffer(forceSync = false)
-                fillADTSHeader(adtsHeaderBuffer, packetSize)
-                writeBuffer.put(adtsHeaderBuffer)
-                writeBuffer.put(encodedData)
+        val codec = mediaCodec ?: return
+        try {
+            if (isEos) {
+                val inputIdx = codec.dequeueInputBuffer(5000)
+                if (inputIdx >= 0) {
+                    codec.queueInputBuffer(inputIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                }
             }
-            mediaCodec?.releaseOutputBuffer(outputIdx, false)
-            outputIdx = mediaCodec?.dequeueOutputBuffer(info, 0) ?: -1
+            
+            var outputIdx = codec.dequeueOutputBuffer(info, 0)
+            while (outputIdx >= 0) {
+                val encodedData = codec.getOutputBuffer(outputIdx)
+                if (encodedData != null && info.size > 0) {
+                    val packetSize = info.size + 7
+                    if (writeBuffer.remaining() < packetSize) flushBuffer(forceSync = false)
+                    fillADTSHeader(adtsHeaderBuffer, packetSize)
+                    writeBuffer.put(adtsHeaderBuffer)
+                    writeBuffer.put(encodedData)
+                }
+                codec.releaseOutputBuffer(outputIdx, false)
+                outputIdx = codec.dequeueOutputBuffer(info, 0)
+            }
+        } catch (e: IllegalStateException) {
+            // This happens if the codec was released by the system or another thread
+            Log.w(TAG, "Codec invalid during drain: ${e.message}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Unexpected drain error", e)
         }
     }
 
@@ -521,12 +539,24 @@ class VoiceRecorder(private val context: Context) {
         audioFocusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
         safeReleaseWakeLock()
         preRollBuffer = null
+        Log.i(TAG, "Cleanup completed ($reason)")
     }
 
     private fun releaseMediaComponents() {
-        try { mediaCodec?.stop(); mediaCodec?.release() } catch (_: Exception) {}
+        try { 
+            mediaCodec?.let {
+                it.stop()
+                it.release()
+            }
+        } catch (_: Exception) {}
         mediaCodec = null
-        try { audioRecord?.stop(); audioRecord?.release() } catch (_: Exception) {}
+        
+        try { 
+            audioRecord?.let {
+                it.stop()
+                it.release()
+            }
+        } catch (_: Exception) {}
         audioRecord = null
     }
     

@@ -7,8 +7,8 @@ import androidx.core.content.edit
 import android.util.Log
 
 /**
- * Direct-Boot aware configuration manager with automatic migration support.
- * Ensures settings persist correctly even when storage location moves for security.
+ * Direct-Boot aware configuration manager.
+ * Optimized for fast instantiation without blocking the main thread.
  */
 class RecorderConfig(context: Context) {
     
@@ -17,18 +17,25 @@ class RecorderConfig(context: Context) {
         private const val TAG = "RecorderConfig"
     }
 
-    private val safeContext: Context = run {
-        val deviceContext = ContextCompat.createDeviceProtectedStorageContext(context) ?: context
-        // Migration: If the protected storage doesn't exist yet, move from credential storage
+    private val safeContext: Context = ContextCompat.createDeviceProtectedStorageContext(context) ?: context
+    private val prefs = safeContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    /**
+     * Performs SharedPreferences migration from credential-encrypted storage to device-protected storage.
+     * Should be called from a background thread during app startup.
+     */
+    fun performMigration(context: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            if (!deviceContext.moveSharedPreferencesFrom(context, PREFS_NAME)) {
-                // If move returns false, it usually means it's already moved or no source exists
+            try {
+                // moveSharedPreferencesFrom is an I/O operation
+                if (safeContext.moveSharedPreferencesFrom(context, PREFS_NAME)) {
+                    Log.i(TAG, "SharedPreferences migrated to device protected storage.")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Migration skipped or failed: ${e.message}")
             }
         }
-        deviceContext
     }
-
-    private val prefs = safeContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     fun saveBatch(
         autoStart: Boolean,
@@ -40,7 +47,7 @@ class RecorderConfig(context: Context) {
         silenceThreshold: Int,
         isAggressiveVad: Boolean
     ) {
-        prefs.edit(commit = true) { // Use commit for cross-process immediate visibility
+        prefs.edit(commit = true) {
             putBoolean("auto_start_enabled", autoStart)
             putBoolean("telemetry_enabled", telemetry)
             putInt("max_chunk_mb", chunkSizeMb)

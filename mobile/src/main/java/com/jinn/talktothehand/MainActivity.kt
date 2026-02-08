@@ -29,8 +29,12 @@ import androidx.core.view.WindowInsetsCompat
 import com.google.android.gms.tasks.Tasks
 import com.google.android.gms.wearable.Wearable
 import java.nio.ByteBuffer
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
+/**
+ * Main Activity for managing settings and monitoring recording transfers.
+ */
 class MainActivity : AppCompatActivity() {
     
     private val requestPermissionLauncher =
@@ -38,16 +42,20 @@ class MainActivity : AppCompatActivity() {
             if (!isGranted) {
                 Toast.makeText(
                     this, 
-                    "Notifications disabled. You won\'t receive updates about recordings.", 
+                    "Notifications disabled. You won't receive updates about recordings.",
                     Toast.LENGTH_LONG
                 ).show()
             }
         }
     
-    private val executor = Executors.newSingleThreadExecutor()
+    private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private lateinit var transferStatusText: TextView
     
-    private val PROTOCOL_VERSION = 3
+    companion object {
+        private const val PROTOCOL_VERSION = 3
+        private const val TAG = "MainActivity"
+        private const val SETTINGS_TIMEOUT_MS = 3000L
+    }
 
     // --- Broadcast Receivers ---
     private val transferReceiver = object : BroadcastReceiver() {
@@ -59,15 +67,15 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     when (status) {
                         VoiceRecordingListenerService.STATUS_STARTED -> {
-                            transferStatusText.text = "Receiving: $filename..."
+                            transferStatusText.text = getString(R.string.receiving_format, filename)
                             transferStatusText.setTextColor(ContextCompat.getColor(this@MainActivity, android.R.color.holo_blue_dark))
                         }
                         VoiceRecordingListenerService.STATUS_COMPLETED -> {
-                            transferStatusText.text = "Saved: $filename"
+                            transferStatusText.text = getString(R.string.saved_format, filename)
                             transferStatusText.setTextColor(ContextCompat.getColor(this@MainActivity, android.R.color.holo_green_dark))
                         }
                         VoiceRecordingListenerService.STATUS_FAILED -> {
-                            transferStatusText.text = "Failed to receive: $filename"
+                            transferStatusText.text = getString(R.string.failed_format, filename)
                             transferStatusText.setTextColor(ContextCompat.getColor(this@MainActivity, android.R.color.holo_red_dark))
                         }
                     }
@@ -85,7 +93,9 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContentView(R.layout.activity_main)
-        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main)) { v, insets ->
+
+        val mainView = findViewById<android.view.View>(R.id.main)
+        ViewCompat.setOnApplyWindowInsetsListener(mainView) { v, insets ->
             val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             v.setPadding(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom)
             insets
@@ -108,19 +118,25 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(transferReceiver, transferFilter, Context.RECEIVER_NOT_EXPORTED)
         } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(transferReceiver, transferFilter)
         }
     }
 
     override fun onPause() {
         super.onPause()
-        unregisterReceiver(transferReceiver)
+        try {
+            unregisterReceiver(transferReceiver)
+        } catch (e: Exception) {
+            Log.w(TAG, "Transfer receiver not registered")
+        }
         cleanupConfigReceiver()
     }
 
     override fun onDestroy() {
-        super.onDestroy()
+        settingsDialog?.dismiss()
         executor.shutdown()
+        super.onDestroy()
     }
     
     private fun requestNotificationPermission() {
@@ -141,31 +157,32 @@ class MainActivity : AppCompatActivity() {
         configReceiver?.let {
             try {
                 unregisterReceiver(it)
-            } catch (e: IllegalArgumentException) {
-                // Receiver might have already been unregistered, ignore
+            } catch (e: Exception) {
+                // Ignore
             }
         }
         configReceiver = null
     }
     
     private fun showSettingsDialog() {
-        cleanupConfigReceiver() // Clean up any previous attempts
+        cleanupConfigReceiver()
         
         Toast.makeText(this, "Fetching settings from watch...", Toast.LENGTH_SHORT).show()
         requestConfigFromWatch()
 
-        // Set up a new receiver to handle the config response
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 if (intent?.action == VoiceRecordingListenerService.ACTION_CONFIG_RECEIVED) {
-                    settingsTimeoutRunnable?.let { settingsTimeoutHandler.removeCallbacks(it) } // Cancel timeout
+                    settingsTimeoutRunnable?.let { settingsTimeoutHandler.removeCallbacks(it) }
+
                     val configData = intent.getByteArrayExtra(VoiceRecordingListenerService.EXTRA_CONFIG_DATA)
+
                     if (configData != null) {
                         parseAndShowDialog(configData)
                     } else {
                         Toast.makeText(this@MainActivity, "Failed to get settings from watch", Toast.LENGTH_SHORT).show()
                     }
-                    cleanupConfigReceiver() // Clean up immediately after use
+                    cleanupConfigReceiver()
                 }
             }
         }
@@ -175,24 +192,28 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(receiver, configFilter, Context.RECEIVER_NOT_EXPORTED)
         } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(receiver, configFilter)
         }
 
-        // Set a timeout for the watch to respond
-        settingsTimeoutRunnable = Runnable {
+        val timeoutRunnable = Runnable {
             runOnUiThread {
                 Toast.makeText(this, "Watch not responding", Toast.LENGTH_SHORT).show()
                 cleanupConfigReceiver()
             }
         }
-        settingsTimeoutHandler.postDelayed(settingsTimeoutRunnable!!, 3000) // 3-second timeout
+        settingsTimeoutRunnable = timeoutRunnable
+        settingsTimeoutHandler.postDelayed(timeoutRunnable, SETTINGS_TIMEOUT_MS)
     }
 
     private fun parseAndShowDialog(configData: ByteArray) {
+        if (isFinishing || isDestroyed) return
+
         val buffer = ByteBuffer.wrap(configData)
-        val version = buffer.int
-        if (version < 3) { 
-            Toast.makeText(this, "Watch app is outdated, please update", Toast.LENGTH_SHORT).show()
+        val version = try { buffer.int } catch (e: Exception) { -1 }
+
+        if (version < PROTOCOL_VERSION) {
+            Toast.makeText(this, "Watch app version mismatch", Toast.LENGTH_SHORT).show()
             return
         }
 
@@ -205,8 +226,9 @@ class MainActivity : AppCompatActivity() {
         val silenceThreshold = buffer.int
         val silenceStrategy = buffer.int
 
-        @Suppress("InflateParams")
-        val dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_settings, null)
+        val inflater = LayoutInflater.from(this)
+        val dialogView = inflater.inflate(R.layout.dialog_settings, null)
+
         val chunkSeekbar = dialogView.findViewById<SeekBar>(R.id.chunk_size_seekbar)
         val chunkValueText = dialogView.findViewById<TextView>(R.id.chunk_size_value_text)
         val storageInput = dialogView.findViewById<EditText>(R.id.storage_size_input)
@@ -214,25 +236,22 @@ class MainActivity : AppCompatActivity() {
         val sampleRateSpinner = dialogView.findViewById<Spinner>(R.id.sample_rate_spinner)
         val autoStartCheckbox = dialogView.findViewById<CheckBox>(R.id.auto_start_checkbox)
         val telemetryCheckbox = dialogView.findViewById<CheckBox>(R.id.telemetry_checkbox)
-
-        // VAD Sensitivity (Slider)
         val silenceThresholdSeekbar = dialogView.findViewById<SeekBar>(R.id.silence_threshold_seekbar)
         val silenceThresholdValueText = dialogView.findViewById<TextView>(R.id.silence_threshold_value_text)
         val silenceStrategySpinner = dialogView.findViewById<Spinner>(R.id.silence_strategy_spinner)
 
-        // --- Setup Chunk Size SeekBar ---
-        chunkValueText.text = "$chunkMb MB"
-        chunkSeekbar.progress = chunkMb - 1 
+        // Setup Chunk Size
+        chunkValueText.text = getString(R.string.mb_format, chunkMb)
+        chunkSeekbar.progress = (chunkMb - 1).coerceIn(0, 19) // Assuming 1-20MB range
         chunkSeekbar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                chunkValueText.text = "${progress + 1} MB"
+                chunkValueText.text = getString(R.string.mb_format, progress + 1)
             }
             override fun onStartTrackingTouch(seekBar: SeekBar?) {}
             override fun onStopTrackingTouch(seekBar: SeekBar?) {}
         })
 
-        // --- Setup VAD Sensitivity Slider ---
-        // Range: 500 - 2000, Step: 100. (2000-500)/100 = 15 steps.
+        // Setup VAD
         silenceThresholdValueText.text = silenceThreshold.toString()
         val thresholdProgress = ((silenceThreshold - 500) / 100).coerceIn(0, 15)
         silenceThresholdSeekbar.progress = thresholdProgress
@@ -254,25 +273,21 @@ class MainActivity : AppCompatActivity() {
         val bitrateAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, bitrateLabels)
         bitrateAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         bitrateSpinner.adapter = bitrateAdapter
-        
-        val currentBitrateIndex = bitrates.indexOf(bitrate)
-        bitrateSpinner.setSelection(if(currentBitrateIndex >= 0) currentBitrateIndex else 1)
+        bitrateSpinner.setSelection(bitrates.indexOf(bitrate).coerceAtLeast(1))
         
         val sampleRates = arrayOf(16000, 44100, 48000)
         val sampleRateLabels = arrayOf("16 kHz", "44.1 kHz", "48 kHz")
         val sampleRateAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, sampleRateLabels)
         sampleRateAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         sampleRateSpinner.adapter = sampleRateAdapter
-        
-        val currentSampleRateIndex = sampleRates.indexOf(sampleRate)
-        sampleRateSpinner.setSelection(if(currentSampleRateIndex >= 0) currentSampleRateIndex else 0)
+        sampleRateSpinner.setSelection(sampleRates.indexOf(sampleRate).coerceAtLeast(0))
         
         val silenceStrategies = arrayOf(0, 1)
         val silenceStrategyLabels = arrayOf("Standard (Reliable)", "Aggressive (Battery Saver)")
         val silenceStrategyAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, silenceStrategyLabels)
         silenceStrategyAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         silenceStrategySpinner.adapter = silenceStrategyAdapter
-        silenceStrategySpinner.setSelection(silenceStrategy.coerceIn(0,1))
+        silenceStrategySpinner.setSelection(silenceStrategy.coerceIn(0, 1))
         
         settingsDialog?.dismiss()
         settingsDialog = AlertDialog.Builder(this)
@@ -281,12 +296,12 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton("Save") { _, _ ->
                 val newChunkMb = chunkSeekbar.progress + 1
                 val newStorageMb = storageInput.text.toString().toIntOrNull() ?: 2048
-                val selectedBitrate = bitrates[bitrateSpinner.selectedItemPosition]
-                val selectedSampleRate = sampleRates[sampleRateSpinner.selectedItemPosition]
+                val selectedBitrate = bitrates.getOrElse(bitrateSpinner.selectedItemPosition) { 32000 }
+                val selectedSampleRate = sampleRates.getOrElse(sampleRateSpinner.selectedItemPosition) { 16000 }
                 val selectedAutoStart = autoStartCheckbox.isChecked
                 val selectedTelemetry = telemetryCheckbox.isChecked
                 val newSilenceThreshold = (silenceThresholdSeekbar.progress * 100) + 500
-                val selectedSilenceStrategy = silenceStrategies[silenceStrategySpinner.selectedItemPosition]
+                val selectedSilenceStrategy = silenceStrategies.getOrElse(silenceStrategySpinner.selectedItemPosition) { 0 }
                 
                 sendConfigToWatch(newChunkMb, newStorageMb, selectedBitrate, selectedSampleRate, selectedAutoStart, selectedTelemetry, newSilenceThreshold, selectedSilenceStrategy)
             }
@@ -305,17 +320,16 @@ class MainActivity : AppCompatActivity() {
                 }
                 Wearable.getMessageClient(this)
                     .sendMessage(node.id, "/config/request_v2", null)
-                    .addOnFailureListener { e -> Log.w("MainActivity", "Failed to send request", e) }
+                    .addOnFailureListener { e -> Log.w(TAG, "Failed to send request", e) }
 
             } catch (e: Exception) {
-                Log.e("MainActivity", "Error requesting config", e)
+                Log.e(TAG, "Error requesting config", e)
             }
         }
     }
     
     private fun sendConfigToWatch(chunkMb: Int, storageMb: Int, bitrate: Int, sampleRate: Int, autoStart: Boolean, telemetryEnabled: Boolean, silenceThreshold: Int, silenceStrategy: Int) {
-        // v3 Packet: Adds silence threshold and strategy
-        val buffer = ByteBuffer.allocate(36) // 9 ints * 4 bytes
+        val buffer = ByteBuffer.allocate(36)
         buffer.putInt(PROTOCOL_VERSION)
         buffer.putInt(chunkMb)
         buffer.putInt(storageMb)
@@ -332,14 +346,14 @@ class MainActivity : AppCompatActivity() {
                 for (node in nodes) {
                     Wearable.getMessageClient(this)
                         .sendMessage(node.id, "/config/update_v2", buffer.array())
-                        .addOnSuccessListener { Log.d("MainActivity", "Config sent to ${node.displayName}") }
-                        .addOnFailureListener { e -> Log.w("MainActivity", "Failed to send config", e) }
+                        .addOnSuccessListener { Log.d(TAG, "Config sent to ${node.displayName}") }
+                        .addOnFailureListener { e -> Log.w(TAG, "Failed to send config", e) }
                 }
                 runOnUiThread {
                     Toast.makeText(this, "Settings Saved to Watch", Toast.LENGTH_SHORT).show()
                 }
             } catch (e: Exception) {
-                Log.e("MainActivity", "Failed to send config", e)
+                Log.e(TAG, "Failed to send config", e)
             }
         }
     }

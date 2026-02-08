@@ -28,6 +28,7 @@
                 <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
                 <action android:name="com.google.android.gms.wearable.CHANNEL_EVENT" />
                 <data android:scheme="wear" android:host="*" android:pathPrefix="/voice_recording"/>
+                <data android:scheme="wear" android:host="*" android:pathPrefix="/telemetry/log"/>
                 <data android:scheme="wear" android:host="*" android:pathPrefix="/telemetry/error"/>
                 <data android:scheme="wear" android:host="*" android:pathPrefix="/config/current_v2"/>
             </intent-filter>

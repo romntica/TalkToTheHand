@@ -1,5 +1,7 @@
 package com.jinn.talktothehand.presentation
 
+import android.content.Context
+import androidx.core.content.ContextCompat
 import java.io.File
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -8,18 +10,18 @@ import java.util.Locale
 
 /**
  * Manages a session lock file to detect ungraceful shutdowns and support recovery.
+ * Optimized for Direct Boot using Device Protected Storage.
  */
-class SessionLock(filesDir: File) {
+class SessionLock(context: Context) {
 
-    private val lockFile = File(filesDir, ".recording_session.lock")
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+    // CRITICAL: Use Device Protected Storage for Direct Boot availability
+    private val safeContext = ContextCompat.createDeviceProtectedStorageContext(context) ?: context
+    private val lockFile = File(safeContext.filesDir, ".recording_session.lock")
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:ss", Locale.getDefault())
 
     val isLocked: Boolean
         get() = lockFile.exists()
 
-    /**
-     * Locks the session and records the current file path for recovery.
-     */
     fun lock(reason: String, lastFilePath: String? = null): Boolean {
         return try {
             val startTime = dateFormat.format(Date())
@@ -33,7 +35,6 @@ class SessionLock(filesDir: File) {
             lockFile.writeText(lockContent)
             true
         } catch (e: IOException) {
-            e.printStackTrace()
             false
         }
     }
@@ -44,8 +45,10 @@ class SessionLock(filesDir: File) {
             val lines = lockFile.readLines().toMutableList()
             val now = dateFormat.format(Date())
             val idx = lines.indexOfFirst { it.startsWith("LastTick:") }
-            if (idx != -1) lines[idx] = "LastTick: $now"
-            lockFile.writeText(lines.joinToString("\n"))
+            if (idx != -1) {
+                lines[idx] = "LastTick: $now"
+                lockFile.writeText(lines.joinToString("\n"))
+            }
         } catch (_: Exception) {}
     }
 
@@ -59,6 +62,4 @@ class SessionLock(filesDir: File) {
     fun unlock() {
         if (isLocked) lockFile.delete()
     }
-
-    fun readLockReason(): String? = if (isLocked) lockFile.readText() else null
 }

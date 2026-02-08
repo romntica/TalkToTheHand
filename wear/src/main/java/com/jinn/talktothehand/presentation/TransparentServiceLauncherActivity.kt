@@ -19,11 +19,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.material.Text
 import kotlinx.coroutines.*
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * A minimalist bridge activity that manages the Recording Engine state.
- * Prevents race conditions using config.isTransitioning lock.
+ * Shows a tiny visual indicator only while starting, then auto-closes immediately.
  */
 class TransparentServiceLauncherActivity : ComponentActivity() {
 
@@ -32,7 +31,7 @@ class TransparentServiceLauncherActivity : ComponentActivity() {
     
     companion object {
         private const val TAG = "LauncherActivity"
-        private const val CONFIRMATION_TIMEOUT_MS = 3000L
+        private const val SYNC_TIMEOUT_MS = 4000L
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -41,70 +40,72 @@ class TransparentServiceLauncherActivity : ComponentActivity() {
         val config = RecorderConfig(applicationContext)
         val guardian = RecordingGuardian(applicationContext)
 
-        // [Race Condition Guard] 
-        // If a transition is already in progress, ignore new touch events.
-        if (config.isTransitioning) {
-            Log.w(TAG, "Transition in progress. Ignoring touch event.")
+        // Safety: Clear transition lock when user intent is explicitly triggered via activity
+        config.isTransitioning = false
+
+        val isRecording = config.isRecording
+        
+        // STOP CASE: Finish immediately
+        if (isRecording && intent.action == VoiceRecorderService.ACTION_TOGGLE_RECORDING) {
+            guardian.reconcileWithAction(isStarting = false)
             finish()
             return
         }
 
-        val targetIsStarting = !config.isRecording
+        // START CASE: Show minimal indicator until engine ACKs
+        var uiMessage by mutableStateOf("● . . .")
+        var uiColor by mutableStateOf(Color(0xFFE91E63)) 
 
-        if (targetIsStarting) {
-            // --- STARTING CASE: Show UI and wait for Engine Ack ---
-            var uiMessage by mutableStateOf("● . . .")
-            var uiColor by mutableStateOf(Color(0xFFE91E63))
-
-            setContent {
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.BottomCenter
-                ) {
-                    Text(
-                        text = uiMessage,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = uiColor,
-                        modifier = Modifier.padding(bottom = 12.dp)
-                    )
-                }
+        setContent {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.BottomCenter
+            ) {
+                Text(
+                    text = uiMessage,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = uiColor,
+                    modifier = Modifier.padding(bottom = 12.dp)
+                )
             }
+        }
 
-            stateReceiver = object : BroadcastReceiver() {
-                override fun onReceive(context: Context, intent: Intent) {
-                    val newState = intent.getBooleanExtra(RecordingGuardian.EXTRA_IS_RECORDING, false)
-                    val error = intent.getStringExtra(RecordingGuardian.EXTRA_ERROR_MESSAGE)
+        stateReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                val newState = intent.getBooleanExtra(RecordingGuardian.EXTRA_IS_RECORDING, false)
+                val error = intent.getStringExtra(RecordingGuardian.EXTRA_ERROR_MESSAGE)
 
-                    if (error != null) {
-                        uiMessage = "! Error"
-                        uiColor = Color.Red
-                        scope.launch { delay(500); safeFinish() }
-                        return
-                    }
-
-                    if (newState == true) {
-                        safeFinish()
-                    }
+                if (error != null) {
+                    uiMessage = "! Error"
+                    uiColor = Color.Red
+                    scope.launch { delay(800); safeFinish() }
+                    return
                 }
-            }
-            registerReceiver(stateReceiver, IntentFilter(RecordingGuardian.ACTION_STATE_CHANGED), Context.RECEIVER_NOT_EXPORTED)
 
-            scope.launch {
-                guardian.reconcileWithAction(isStarting = true)
-                
-                // Fallback: If no response, ensure we unlock and finish
-                delay(CONFIRMATION_TIMEOUT_MS)
-                if (isActive) {
-                    Log.w(TAG, "Sync timeout. Forcing unlock.")
-                    config.isTransitioning = false 
+                // UI Requirement: Disappear immediately once recording starts
+                if (newState) {
                     safeFinish()
                 }
             }
-        } else {
-            // --- STOPPING CASE: No UI, finish immediately ---
-            guardian.reconcileWithAction(isStarting = false)
-            finish()
+        }
+        
+        registerReceiver(
+            stateReceiver, 
+            IntentFilter(RecordingGuardian.ACTION_STATE_CHANGED), 
+            Context.RECEIVER_NOT_EXPORTED
+        )
+
+        scope.launch {
+            // Reconcile state
+            guardian.reconcileWithAction(isStarting = true)
+            
+            // Watchdog: Ensure the bridge closes even if service fails to report
+            delay(SYNC_TIMEOUT_MS)
+            if (isActive) {
+                config.isTransitioning = false 
+                safeFinish()
+            }
         }
     }
 

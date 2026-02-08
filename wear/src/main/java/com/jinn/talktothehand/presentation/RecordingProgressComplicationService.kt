@@ -13,7 +13,7 @@ import kotlinx.coroutines.*
 
 /**
  * High-reliability Complication Service.
- * Actively triggers integrity checks to ensure status accuracy.
+ * Optimized for Direct Boot and passive state reading.
  */
 class RecordingProgressComplicationService : ComplicationDataSourceService() {
 
@@ -27,29 +27,22 @@ class RecordingProgressComplicationService : ComplicationDataSourceService() {
         request: ComplicationRequest,
         listener: ComplicationRequestListener
     ) {
-        Log.d(TAG, "Request received: ${request.complicationType}")
-
         serviceScope.launch {
             try {
                 val context = applicationContext
-                val guardian = RecordingGuardian(context)
                 
-                // 1. Proactively verify engine state to clear any stale "Recording" indicators
-                // This is essential since this process might start without MainActivity.
-                guardian.verifyIntegrity()
-
-                // 2. Read state file (guaranteed to be corrected by verifyIntegrity above)
+                // 1. Read state & config via protected storage (Direct Boot compatible)
                 val sessionState = SessionState(context).read()
+                val config = RecorderConfig(context)
                 
                 val isRecording = sessionState.isRecording
                 val isPaused = sessionState.isPaused
                 
-                val prefs = context.getSharedPreferences("recorder_config", Context.MODE_PRIVATE)
-                val maxChunkMb = prefs.getInt("max_chunk_mb", 5)
-                val maxSize = (maxChunkMb * 1024L * 1024L).toFloat().coerceAtLeast(1f)
+                // Use maxChunkSizeMb from config which handles storage migration correctly
+                val maxSize = config.maxChunkSizeBytes.toFloat().coerceAtLeast(1f)
                 val progressPercent = if (isRecording) (sessionState.sizeBytes.toFloat() / maxSize).coerceIn(0f, 1f) * 100f else 0f
 
-                // 3. UI Assets
+                // 2. UI Assets
                 val iconResId = when {
                     isPaused -> R.drawable.ic_complication_stop
                     isRecording -> R.drawable.ic_complication_record
@@ -57,7 +50,7 @@ class RecordingProgressComplicationService : ComplicationDataSourceService() {
                 }
                 val statusText = if (isRecording && !isPaused) sessionState.chunkCount.toString() else "--"
 
-                // 4. Tap Action
+                // 3. Tap Action
                 val tapIntent = Intent(context, TransparentServiceLauncherActivity::class.java).apply {
                     action = VoiceRecorderService.ACTION_TOGGLE_RECORDING
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
@@ -67,6 +60,7 @@ class RecordingProgressComplicationService : ComplicationDataSourceService() {
                     PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
                 )
 
+                // 4. Construct Data with resource safety
                 val data = when (request.complicationType) {
                     ComplicationType.RANGED_VALUE -> {
                         RangedValueComplicationData.Builder(
