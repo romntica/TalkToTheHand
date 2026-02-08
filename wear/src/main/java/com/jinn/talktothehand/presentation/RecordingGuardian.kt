@@ -41,17 +41,22 @@ class RecordingGuardian(private val context: Context) {
         const val EXTRA_IS_HEARTBEAT = "is_heartbeat"
         const val EXTRA_HEARTBEAT_COUNT = "heartbeat_count"
 
-        // defensive delays optimized for the 20s system boot allowlist
         private const val BOOT_RECOVERY_DELAY_MS = 3000L  
         private const val BOOT_AUTOSTART_DELAY_MS = 7000L 
 
         private val isHandlingStartup = AtomicBoolean(false)
+        
+        // STATIC: Track current startup job across instances to prevent overlapping auto-starts
+        private var activeStartupJob: Job? = null
     }
 
     /**
      * Reconciles recording state based on a specific user action (Start/Stop).
      */
     fun reconcileWithAction(isStarting: Boolean) {
+        // IMPORTANT: Cancel any pending auto-start logic immediately if user takes control
+        cancelPendingStartup()
+        
         scope.launch {
             config.isTransitioning = true
             if (isStarting) {
@@ -61,9 +66,18 @@ class RecordingGuardian(private val context: Context) {
                 Log.d(TAG, "reconcileWithAction: STOP requested")
                 stopEngine()
             }
-            // User actions always force a complication refresh
             refreshComplications(force = true)
         }
+    }
+
+    private fun cancelPendingStartup() {
+        activeStartupJob?.let {
+            if (it.isActive) {
+                Log.i(TAG, "Cancelling pending startup sequence due to manual intervention.")
+                it.cancel()
+            }
+        }
+        activeStartupJob = null
     }
 
     /**
@@ -95,35 +109,50 @@ class RecordingGuardian(private val context: Context) {
     fun handleStartup(isBoot: Boolean = false) {
         if (isBoot && isHandlingStartup.getAndSet(true)) return
 
-        scope.launch {
-            val isEngineActuallyLocked = sessionLock.isLocked
-            
-            // POLICY: Start complications as IDLE by default on every boot/launch. 
-            // Only update once engine reports success.
-            forceResetUIState()
+        // Cancel any previous sequence before starting a new one
+        cancelPendingStartup()
 
-            if (isBoot) {
-                Log.i(TAG, "Boot startup sequence initiated.")
-                if (isEngineActuallyLocked) {
-                    recoverAbandonedFile()
-                    delay(BOOT_RECOVERY_DELAY_MS)
-                    startEngineViaActivity("BootRecovery")
-                } else if (config.isAutoStartEnabled) {
-                    delay(BOOT_AUTOSTART_DELAY_MS)
-                    if (config.isAutoStartEnabled && !sessionLock.isLocked) {
-                        startEngineViaActivity("BootAutoStart")
+        activeStartupJob = scope.launch {
+            try {
+                val isEngineActuallyLocked = sessionLock.isLocked
+                
+                // Reset UI to idle before assessing state
+                forceResetUIState()
+
+                if (isBoot) {
+                    Log.i(TAG, "Boot startup sequence initiated.")
+                    if (isEngineActuallyLocked) {
+                        recoverAbandonedFile()
+                        delay(BOOT_RECOVERY_DELAY_MS)
+                        ensureActive { return@launch }
+                        startEngineViaActivity("BootRecovery")
+                    } else if (config.isAutoStartEnabled) {
+                        Log.d(TAG, "AutoStart pending... waiting ${BOOT_AUTOSTART_DELAY_MS}ms")
+                        delay(BOOT_AUTOSTART_DELAY_MS)
+                        
+                        // Re-check conditions after delay
+                        ensureActive { return@launch }
+                        if (config.isAutoStartEnabled && !sessionLock.isLocked) {
+                            startEngineViaActivity("BootAutoStart")
+                        }
                     }
+                    delay(5000L)
+                    isHandlingStartup.set(false)
+                } else {
+                    // Regular App Open or Crash Recovery
+                    if (isEngineActuallyLocked) {
+                        recoverAbandonedFile()
+                        startEngine("CrashRecovery")
+                    } else if (config.isAutoStartEnabled) {
+                        startEngine("AppOpenAutoStart")
+                    }
+                    refreshComplications(force = true)
                 }
-                delay(5000L)
-                isHandlingStartup.set(false)
-            } else {
-                if (isEngineActuallyLocked) {
-                    recoverAbandonedFile()
-                    startEngine("CrashRecovery")
-                } else if (config.isAutoStartEnabled) {
-                    startEngine("AppOpenAutoStart")
+            } finally {
+                // Clear the job reference when done
+                if (activeStartupJob?.isActive == false) {
+                    activeStartupJob = null
                 }
-                refreshComplications(force = true)
             }
         }
     }
@@ -194,15 +223,19 @@ class RecordingGuardian(private val context: Context) {
         })
     }
 
+    private inline fun ensureActive(block: () -> Unit) {
+        if (activeStartupJob?.isCancelled == true) {
+            Log.d(TAG, "Startup sequence aborted (Job Cancelled)")
+            block()
+        }
+    }
+
     /**
      * Refreshes all complication providers.
-     * Removed isInteractive check to ensure complications are updated even when screen is dimmed/AOD.
      */
     fun refreshComplications(force: Boolean = false) {
-        // Optimization: System handles rate limiting for requestUpdateAll()
         listOf(
             RecordingProgressComplicationService::class.java,
-            QuickRecordIconComplicationService::class.java,
             QuickRecordComplicationService::class.java
         ).forEach { serviceClass ->
             try {
@@ -234,8 +267,6 @@ class RecordingGuardian(private val context: Context) {
                     config.sessionChunkCount = count
                     config.isTransitioning = false
                     
-                    // Always refresh complications when state changes (size, recording status, etc.)
-                    // Heartbeats are also important for keeping the UI in sync.
                     guardian.refreshComplications(force = true)
                 }
                 ACTION_FILE_READY -> {

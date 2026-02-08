@@ -36,6 +36,8 @@ class VoiceRecorderService : Service() {
         private val VIBRATION_STOP = VibrationEffect.createOneShot(100, 80)
         private const val HEARTBEAT_INTERVAL_MS = 30000L
         private const val BATTERY_CRITICAL_THRESHOLD = 2 // 2%
+        private const val NOTIFICATION_ID = 101
+        private const val CHANNEL_ID = "RecorderChannel"
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -103,13 +105,15 @@ class VoiceRecorderService : Service() {
             addAction(ACTION_SYNC_STATS)
             addAction(Intent.ACTION_BATTERY_LOW)
         }
-        registerReceiver(systemReceiver, filter, RECEIVER_NOT_EXPORTED)
+        // Explicitly set RECEIVER_NOT_EXPORTED for security and to resolve API 34+ warnings
+        registerReceiver(systemReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         updateSyncState()
     }
 
     override fun onDestroy() {
         try { unregisterReceiver(systemReceiver) } catch (_: Exception) {}
         updateSyncState(false, false)
+        serviceScope.cancel()
         super.onDestroy()
     }
 
@@ -148,7 +152,6 @@ class VoiceRecorderService : Service() {
         if (recorder?.start(file, "EngineStart") == true) {
             config.isRecording = true
             updateSyncState()
-            // CRITICAL: 즉각적인 컴플리케이션 상태 변경을 위해 시작 성공 즉시 보고
             reportStateToGuardian(true, isPaused = false, isHeartbeat = false)
             startMonitoringLoop()
         } else {
@@ -166,8 +169,7 @@ class VoiceRecorderService : Service() {
             var lastHeartbeatTime = System.currentTimeMillis()
             heartbeatCount = 0
             
-            // 사용자 제안: 청크 크기의 1/30을 업데이트 문턱값으로 설정
-            val sizeThreshold = (config.maxChunkSizeBytes / 30).coerceAtLeast(1024L * 50) // 최소 50KB
+            val sizeThreshold = (config.maxChunkSizeBytes / 30).coerceAtLeast(1024L * 50)
 
             while (isActive && recorder?.isRecording == true) {
                 val currentSize = recorder?.currentFileSize ?: 0L
@@ -176,18 +178,15 @@ class VoiceRecorderService : Service() {
                 
                 updateSyncState()
 
-                // 주기적인 배터리 체크 (약 6분 간격)
                 if (heartbeatCount % 12 == 0L) {
                     checkBatteryAndStopIfNeeded()
                 }
 
-                // 사이즈 기반 업데이트: 화면이 켜져 있을 때만 실시간성을 위해 보고
                 if (powerManager.isInteractive && (currentSize - lastReportedSize >= sizeThreshold)) {
                     reportStateToGuardian(true, isPaused = isPaused, isHeartbeat = false)
                     lastReportedSize = currentSize
                 }
                 
-                // 하트비트 (30초): 화면이 꺼져 있어도 최소한의 동기화 보장
                 if (now - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
                     heartbeatCount++
                     sessionLock.updateTick() 
@@ -219,7 +218,9 @@ class VoiceRecorderService : Service() {
     }
 
     private fun getBatteryLevel(): Int {
-        val batteryStatus: Intent? = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        // receiver parameter is null to just get current status
+        val batteryStatus: Intent? = registerReceiver(null, filter, Context.RECEIVER_NOT_EXPORTED)
         val level = batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
         val scale = batteryStatus?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
         return if (level != -1 && scale != -1) (level * 100 / scale.toFloat()).toInt() else 100
@@ -318,27 +319,41 @@ class VoiceRecorderService : Service() {
     }
 
     private fun startForegroundWithMicrophone() {
-        val notification = NotificationCompat.Builder(this, "RecorderChannel")
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("TalkToTheHand")
             .setContentText("Recording engine active.")
             .setSmallIcon(R.mipmap.ic_launcher)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
+            
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(101, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
         } else {
-            startForeground(101, notification)
+            startForeground(NOTIFICATION_ID, notification)
         }
     }
 
     private fun createNotificationChannel() {
-        val chan = NotificationChannel("RecorderChannel", "Engine", NotificationManager.IMPORTANCE_LOW)
-        getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
+        val nm = getSystemService(NotificationManager::class.java)
+        if (nm.getNotificationChannel(CHANNEL_ID) == null) {
+            val chan = NotificationChannel(CHANNEL_ID, "Engine", NotificationManager.IMPORTANCE_LOW)
+            chan.description = "Background recording engine status"
+            chan.setShowBadge(false)
+            nm.createNotificationChannel(chan)
+        }
     }
 
     private fun vibrate(effect: VibrationEffect) {
-        (getSystemService(VIBRATOR_SERVICE) as Vibrator).vibrate(effect)
+        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vibratorManager = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+            vibratorManager.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        }
+        vibrator.vibrate(effect)
     }
 
     override fun onBind(intent: Intent?): IBinder = messenger.binder

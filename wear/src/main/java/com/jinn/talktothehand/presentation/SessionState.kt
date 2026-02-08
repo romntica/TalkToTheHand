@@ -11,7 +11,6 @@ import java.io.RandomAccessFile
  * Uses Device Protected Storage to ensure availability before first unlock.
  */
 class SessionState(context: Context) {
-    // CRITICAL: Use Device Protected Storage for Direct Boot compatibility
     private val safeContext = ContextCompat.createDeviceProtectedStorageContext(context) ?: context
     private val stateFile = File(safeContext.filesDir, "recording_status.bin")
     private val tempFile = File(safeContext.filesDir, "recording_status.bin.tmp")
@@ -22,6 +21,10 @@ class SessionState(context: Context) {
         private const val EXPECTED_SIZE = 16L
     }
 
+    /**
+     * Updates the global recording state.
+     * Uses a safer rename strategy to ensure cross-process visibility and atomicity.
+     */
     fun update(isRecording: Boolean, isPaused: Boolean, chunkCount: Int, sizeBytes: Long) {
         try {
             RandomAccessFile(tempFile, "rw").use { raf ->
@@ -33,8 +36,13 @@ class SessionState(context: Context) {
                 raf.writeLong(sizeBytes)
                 raf.fd.sync()
             }
+            
+            // Standard atomic rename. If it fails (e.g. file busy), try delete then rename.
             if (!tempFile.renameTo(stateFile)) {
-                Log.e(TAG, "Rename failed")
+                stateFile.delete()
+                if (!tempFile.renameTo(stateFile)) {
+                    Log.e(TAG, "Critical: Failed to sync state file to disk.")
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Update error", e)
@@ -42,7 +50,9 @@ class SessionState(context: Context) {
     }
 
     fun read(): State {
+        // Always check if file exists first to avoid unnecessary exceptions
         if (!stateFile.exists()) return State()
+        
         try {
             RandomAccessFile(stateFile, "r").use { raf ->
                 if (raf.length() < EXPECTED_SIZE) return State()
@@ -55,6 +65,7 @@ class SessionState(context: Context) {
                 )
             }
         } catch (e: Exception) {
+            // Passive failure: return default state (idle)
             return State()
         }
     }

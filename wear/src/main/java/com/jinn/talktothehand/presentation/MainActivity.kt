@@ -50,8 +50,6 @@ class MainActivity : ComponentActivity() {
         val packageName = packageName
         if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
             Log.w(TAG, "App is NOT whitelisted from battery optimizations. MARs may freeze processes.")
-            // On Wear OS, we usually show a prompt or toast. 
-            // For now, we log it and provide a way to open settings if needed.
         } else {
             Log.i(TAG, "App is whitelisted from battery optimizations. Performance should be stable.")
         }
@@ -59,7 +57,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        guardian.requestImmediateSync()
+        if (::guardian.isInitialized) {
+            guardian.requestImmediateSync()
+        }
     }
 
     companion object {

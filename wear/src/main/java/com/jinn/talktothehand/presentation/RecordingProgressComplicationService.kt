@@ -14,6 +14,7 @@ import kotlinx.coroutines.*
 /**
  * High-reliability Complication Service.
  * Optimized for Direct Boot and passive state reading.
+ * Supports MonochromaticImage for better compatibility with watch face edge slots.
  */
 class RecordingProgressComplicationService : ComplicationDataSourceService() {
 
@@ -72,6 +73,14 @@ class RecordingProgressComplicationService : ComplicationDataSourceService() {
                         .setTapAction(pendingIntent)
                         .build()
                     }
+                    ComplicationType.MONOCHROMATIC_IMAGE -> {
+                        MonochromaticImageComplicationData.Builder(
+                            monochromaticImage = MonochromaticImage.Builder(Icon.createWithResource(context, iconResId)).build(),
+                            contentDescription = PlainComplicationText.Builder("Status").build()
+                        )
+                        .setTapAction(pendingIntent)
+                        .build()
+                    }
                     ComplicationType.SMALL_IMAGE -> {
                         SmallImageComplicationData.Builder(
                             smallImage = SmallImage.Builder(Icon.createWithResource(context, iconResId), SmallImageType.ICON).build(),
@@ -107,8 +116,32 @@ class RecordingProgressComplicationService : ComplicationDataSourceService() {
     }
 
     override fun getPreviewData(type: ComplicationType): ComplicationData? {
-        val icon = MonochromaticImage.Builder(Icon.createWithResource(this, R.drawable.ic_complication_record)).build()
+        val icon = Icon.createWithResource(this, R.drawable.ic_complication_record)
+        val monoIcon = MonochromaticImage.Builder(icon).build()
         val text = PlainComplicationText.Builder("1").build()
-        return RangedValueComplicationData.Builder(50f, 0f, 100f, text).setMonochromaticImage(icon).setText(text).build()
+        
+        return when (type) {
+            ComplicationType.RANGED_VALUE -> {
+                RangedValueComplicationData.Builder(50f, 0f, 100f, text)
+                    .setMonochromaticImage(monoIcon)
+                    .setText(text)
+                    .build()
+            }
+            ComplicationType.MONOCHROMATIC_IMAGE -> {
+                MonochromaticImageComplicationData.Builder(monoIcon, text).build()
+            }
+            ComplicationType.SMALL_IMAGE -> {
+                SmallImageComplicationData.Builder(
+                    SmallImage.Builder(icon, SmallImageType.ICON).build(),
+                    text
+                ).build()
+            }
+            ComplicationType.SHORT_TEXT -> {
+                ShortTextComplicationData.Builder(text, text)
+                    .setMonochromaticImage(monoIcon)
+                    .build()
+            }
+            else -> null
+        }
     }
 }

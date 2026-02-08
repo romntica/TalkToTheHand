@@ -12,35 +12,33 @@ import com.jinn.talktothehand.R
 import kotlinx.coroutines.*
 
 /**
- * Super-optimized Icon Complication.
- * Actively triggers state integrity check before providing data.
+ * Super-optimized Icon-only Complication.
+ * Supports MonochromaticImage and SmallImage for maximum compatibility with icon slots.
  */
 class QuickRecordComplicationService : ComplicationDataSourceService() {
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     companion object {
-        private const val TAG = "QuickComplication"
+        private const val TAG = "QuickIconComplication"
     }
 
     override fun onComplicationRequest(
         request: ComplicationRequest,
         listener: ComplicationRequestListener
     ) {
-        Log.d(TAG, "Request received: ${request.complicationType}")
-
         serviceScope.launch {
             try {
                 val context = applicationContext
                 val guardian = RecordingGuardian(context)
                 
-                // 1. Force state correction before responding
+                // 1. Force state correction
                 guardian.verifyIntegrity()
 
-                // 2. Read the corrected state
+                // 2. Read state
                 val state = SessionState(context).read()
                 
-                // 3. Select UI Assets
+                // 3. Select Icon
                 val iconResId = when {
                     state.isPaused -> R.drawable.ic_complication_stop
                     state.isRecording -> R.drawable.ic_complication_record
@@ -57,18 +55,31 @@ class QuickRecordComplicationService : ComplicationDataSourceService() {
                     PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
                 )
 
-                // 5. Construct Data
-                val data = SmallImageComplicationData.Builder(
-                    smallImage = SmallImage.Builder(Icon.createWithResource(context, iconResId), SmallImageType.ICON).build(),
-                    contentDescription = PlainComplicationText.Builder("Quick Record").build()
-                )
-                .setTapAction(pendingIntent)
-                .build()
+                // 5. Construct pure Image Data
+                val data = when (request.complicationType) {
+                    ComplicationType.MONOCHROMATIC_IMAGE -> {
+                        MonochromaticImageComplicationData.Builder(
+                            monochromaticImage = MonochromaticImage.Builder(Icon.createWithResource(context, iconResId)).build(),
+                            contentDescription = PlainComplicationText.Builder("Quick Record").build()
+                        )
+                        .setTapAction(pendingIntent)
+                        .build()
+                    }
+                    ComplicationType.SMALL_IMAGE -> {
+                        SmallImageComplicationData.Builder(
+                            smallImage = SmallImage.Builder(Icon.createWithResource(context, iconResId), SmallImageType.ICON).build(),
+                            contentDescription = PlainComplicationText.Builder("Quick Record").build()
+                        )
+                        .setTapAction(pendingIntent)
+                        .build()
+                    }
+                    else -> null
+                }
 
                 listener.onComplicationData(data)
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Async error", e)
+                Log.e(TAG, "Request failed", e)
                 listener.onComplicationData(null)
             }
         }
@@ -81,9 +92,20 @@ class QuickRecordComplicationService : ComplicationDataSourceService() {
 
     override fun getPreviewData(type: ComplicationType): ComplicationData? {
         val icon = Icon.createWithResource(this, R.drawable.ic_complication_record)
-        return SmallImageComplicationData.Builder(
-            SmallImage.Builder(icon, SmallImageType.ICON).build(),
-            PlainComplicationText.Builder("Record").build()
-        ).build()
+        return when (type) {
+            ComplicationType.MONOCHROMATIC_IMAGE -> {
+                MonochromaticImageComplicationData.Builder(
+                    MonochromaticImage.Builder(icon).build(),
+                    PlainComplicationText.Builder("Record").build()
+                ).build()
+            }
+            ComplicationType.SMALL_IMAGE -> {
+                SmallImageComplicationData.Builder(
+                    SmallImage.Builder(icon, SmallImageType.ICON).build(),
+                    PlainComplicationText.Builder("Record").build()
+                ).build()
+            }
+            else -> null
+        }
     }
 }
