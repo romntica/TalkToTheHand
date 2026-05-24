@@ -26,11 +26,16 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // TODO: Replace with your actual release signing config
             signingConfig = signingConfigs.getByName("debug")
+            
+            // Optimization: ensure pseudolocales are disabled in release
+            isPseudoLocalesEnabled = false
         }
     }
     compileOptions {
